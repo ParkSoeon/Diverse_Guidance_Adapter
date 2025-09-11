@@ -20,6 +20,8 @@ from trl.trainer.utils import (
     pad,
     print_prompt_completions_sample,
     selective_log_softmax,
+    get_high_entropy_mask,
+    nanmin, nanmax
 )
 import wandb
 
@@ -70,9 +72,6 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
             "Please check your configuration."
         )
 
-        # Create a list of diversity guidance adapter names
-        self.diversity_adapters = self.args.guidance_adapter_names
-
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
@@ -99,7 +98,7 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
-        # # Compute the per_token_logps and the entropy at each position in the completion
+        # Compute the per_token_logps and the entropy at each position in the completion
         # per_token_logps, entropies = self._get_per_token_logps_and_entropies(
         #     model,
         #     input_ids,
@@ -111,6 +110,13 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
         #     pixel_attention_mask=inputs.get("pixel_attention_mask"),
         #     image_sizes=inputs.get("image_sizes"),
         # )
+        per_token_logps, entropies = self._get_per_token_logps_and_entropies(
+            model,
+            input_ids,
+            attention_mask,
+            logits_to_keep,
+            compute_entropy=True,
+        )
 
         common_loss_data = {
             "per_token_logps": per_token_logps,
@@ -122,14 +128,14 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
 
         total_loss = 0.0
 
-        # Main
+        # Main Adapter Loss
         main_loss = self._compute_adapter_loss(per_token_logps, entropies, common_data, guidance_data["main"]["advantages"])
         total_loss += main_loss
 
-        # Guidance Adapters
+        # Guidance Adapters Losses
         for adapter_name in self.diversity_adapters:
             adapter_advantages = guidance_data["guidance"][adapter_name]["advantages"]
-            guidance_loss = self._compute_adapter_loss(per_token_logps, entropies, common_data, adapter_advantages)
+            guidance_loss = self._compute_adapter_loss(model, per_token_logps, entropies, common_data, adapter_advantages)
             total_loss += guidance_loss
         
         return total_loss
@@ -145,14 +151,6 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
-
-        per_token_logps, entropies = self._get_per_token_logps_and_entropies(
-            model,
-            input_ids,
-            attention_mask,
-            logits_to_keep,
-            compute_entropy=True,
-        )
 
         if self.top_entropy_quantile < 1.0:
             entropy_mask = get_high_entropy_mask(entropies, completion_mask, 1 - self.top_entropy_quantile)
@@ -242,41 +240,11 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
 
         return loss
 
-    def forward_process(self, batch, prompt_index, mask_id, seed=None):
-        set_seed(seed)
-        b, l = batch.shape
-        t_p = torch.ones(b, device=batch.device) * self.args.p_mask_prompt
-
-        # Create a random matrix to decide whether each prompt token is masked
-        random_matrix = torch.rand((b, l), device=batch.device)
-
-        # For prompt tokens: mask if random_matrix < t_p
-        # For completion tokens: always mask
-        is_mask_prompt = prompt_index & (random_matrix < t_p.unsqueeze(1))
-        is_mask_completion = ~prompt_index  # all completion tokens are masked
-        is_mask = is_mask_prompt | is_mask_completion
-
-        # Create a noisy (masked) batch
-        noisy_batch = torch.where(is_mask, mask_id, batch)
-
-        # Build p_mask, the probability that each token is masked under this scheme
-        #   - p_mask[i, j] = t_p[i] if it's a prompt token
-        #   - p_mask[i, j] = 1      if it's a completion token
-        p_mask = torch.where(
-            prompt_index,
-            t_p.unsqueeze(1),  # prompt token probability
-            torch.ones_like(t_p).unsqueeze(1),  # completion token probability
-        )
-
-        return noisy_batch, p_mask
-
-    def get_logits(self, model, batch, prompt_index, cfg_scale, mask_id):
+    def get_logits(self, model, batch, prompt_index):
         if cfg_scale > 0.0:
             assert len(prompt_index) == batch.shape[1]
             prompt_index = prompt_index.unsqueeze(0).repeat(batch.shape[0], 1)
             un_batch = batch.clone()
-            un_batch[prompt_index] = mask_id
-            batch = torch.cat([batch, un_batch])
 
         input = batch
         logits = model(input).logits
@@ -323,24 +291,9 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
         prompt_index = torch.zeros(seq_len, dtype=torch.bool, device=device)
         prompt_index[:prompt_length] = True  # Mark prompt tokens as True
 
-        # applying masks
-        all_perturbed_seqs = []
-        all_expanded_inputs = []
-        for iter_idx, mask_seed in enumerate(mask_seeds):
-            expanded_input = input_ids[iter_idx]  # [batch_size, seq_len]
-            perturbed_seq, _ = self.forward_process(
-                expanded_input, prompt_index, self.args.mask_id, seed=mask_seed
-            )
-            all_perturbed_seqs.append(perturbed_seq)
-            all_expanded_inputs.append(expanded_input)
-
-        # Concatenate all iterations into a single batch
-        perturbed_seq = torch.cat(all_perturbed_seqs, dim=0)  # [num_iterations * batch_size, seq_len]
-        expanded_input = torch.cat(all_expanded_inputs, dim=0)  # [num_iterations * batch_size, seq_len]
-
         # Get model predictions for the combined batch
         logits = self.get_logits(
-            model, perturbed_seq, prompt_index, self.args.cfg_scale, self.args.mask_id
+            model, prompt_index
         )  # [num_iterations * batch_size, seq_len, vocab_size]
 
         # Calculate cross-entropy loss for completion tokens only
@@ -359,7 +312,7 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
         per_token_logps = completion_log_probs.view(num_iterations, batch_size, logits_to_keep)
 
         # Clean up memory
-        del perturbed_seq, logits, all_perturbed_seqs, all_expanded_inputs
+        del logits
         torch.cuda.empty_cache()
         per_token_logps = per_token_logps.to(torch.float32)
         return per_token_logps
@@ -411,6 +364,8 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
         repeat_penalty = float(self.args.repeat_penalty or 1.0)
         num_main = int(self.args.num_candidates_main)
         num_per_guidance = int(self.args.num_candidates_per_guidance)
+
+        prompt_completion_ids_all = []
 
         with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
             generation_batch_size = self.args.generation_batch_size # always set same as per_device_train_batch_size
@@ -527,9 +482,9 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
                 except:
                     pass
             
-            # Free GPU cache per batch(Optional...)
-            del batch_prompt_ids
-            torch.cuda.empty_cache()
+                # Free GPU cache per batch(Optional...)
+                del batch_prompt_ids
+                torch.cuda.empty_cache()
 
         for batch_main in all_generations["main"]:
             prompt_completion_ids_all.append(batch_main)
@@ -541,7 +496,6 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
         prompt_completion_ids = torch.cat(prompt_completion_ids_all, dim=0)
 
         # Concat all generations
-        prompt_completion_ids_all = []
         
         # Compute prompt length and extract completion ids
         # At this point, 'prompt_completion_ids' a tensor of shape: (batch_size * num_generations, seq_len)
@@ -562,12 +516,8 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
         # This process can be slow or expensive; keep generation batch size small to avoid OOM
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
-        if self.args.random_masking:
-            # use random seeds for every iterations in GRPO iterations
-            mask_seeds = torch.randint(0, 2**12, (self.num_iterations,), device=device)
-        else:
-            # use fixed seeds for every iterations in GRPO iterations
-            mask_seeds = [42] * self.num_iterations
+        # use fixed seeds for every iterations in GRPO iterations
+        mask_seeds = [42] * self.num_iterations
 
         all_old_per_token_logps = []
         all_ref_per_token_logps = []
@@ -653,7 +603,7 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
 
         # Split Rewards per type of Generation Adapter
-        adapter_rewards = {}
+        adapter_rewards = {"main": None, "guidance": {}}
         start_idx = 0
 
         # Main Adapter Rewards
@@ -664,23 +614,24 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
         # Guidance Adapters Rewards
         for adapter_name in self.diversity_adapters:
             end_idx = start_idx + len(prompts) * num_per_guidance
-            adapter_rewards[adapter_name] = rewards[start_idx:end_idx]
+            adapter_rewards["guidance"][adapter_name] = rewards[start_idx:end_idx]
             start_idx = end_idx
         
-        adapter_advantages = {}
+        adapter_advantages = {"main": None, "guidance": {}}
 
         # Compute Advantages per Adapter
         # Main
         main_rewards_grouped = adapter_rewards["main"].view(-1, num_main)
         main_mean_rewards = main_rewards_grouped.mean(dim=1)
-        adapter_advantages["main"] = adapter_rewards["main"] - main_mean_rewards.repeat_interleave(num_main, dim=0)
+        adapter_advantages["main"] = (
+            adapter_rewards["main"] - main_mean_rewards.repeat_interleave(num_main, dim=0)
+        )
         # Guidance
-        adapter_advantages["guidance"] = {}
         for adapter_name in self.diversity_adapters:
-            guidance_rewards_grouped = adapter_rewards[adapter_name].view(-1, num_per_guidance)
+            guidance_rewards_grouped = adapter_rewards["guidance"][adapter_name].view(-1, num_per_guidance)
             guidance_mean_rewards = guidance_rewards_grouped.mean(dim=1)
             adapter_advantages["guidance"][adapter_name] = (
-                adapter_rewards[adapter_name] - guidance_mean_rewards.repeat_interleave(num_per_guidance, dim=0)
+                adapter_rewards["guidance"][adapter_name] - guidance_mean_rewards.repeat_interleave(num_per_guidance, dim=0)
             )
 
         # Overall Mean and Std (for logging only)
@@ -733,6 +684,9 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
         if self.log_completions and self.state.global_step % self.args.logging_steps == 0:
             prompts_to_log = gather_object(prompts_text)
             completions_to_log = gather_object(completions_text)
+
+            # Gather advantages and rewards
+            main_advantages = adapter_advantages["main"]
             advantages_to_log = gather_object(advantages.tolist())
             rewards_to_log = rewards.tolist()
             
