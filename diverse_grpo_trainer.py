@@ -61,6 +61,18 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
             peft_config=peft_config,
         )
 
+        # Check if num of Candidates is consistent with num_generations and diversity guidance adapters
+        total_candidates = (
+            self.args.num_candidates_main + self.args.num_candidates_per_guidance * self.args.num_diversity_adapters
+        )
+        assert total_candidates == self.num_generations, (
+            f"Total candidates ({total_candidates}) does not match num_generations ({self.num_generations}). "
+            "Please check your configuration."
+        )
+
+        # Create a list of diversity guidance adapter names
+        self.diversity_adapters = self.args.guidance_adapter_names
+
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
@@ -73,6 +85,12 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
             return self._compute_loss(model, inputs)
 
     def _compute_loss(self, model, inputs):
+        # Extract Metadata from Commons
+        common_data = inputs["common"]
+        guidance_data = inputs["guidance"]
+
+        total_loss = 0.0
+
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
@@ -107,6 +125,21 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
 
         # Compute the loss
         advantages = inputs["advantages"]
+
+        main_advantages = guidance_data["main"]["advantages"]
+        main_loss = self._compute_adapter_loss(model, common_data, main_advantages, "main")
+        total_loss += main_loss
+
+        # Guidance Adapters Losses
+        for adapter_name in self.diversity_adapters:
+            adapter_advantages = guidance_data["guidance"][adapter_name]["advantages"]
+            guidance_loss = self._compute_adapter_loss(model, common_data, adapter_advantages, adapter_name)
+            total_loss += guidance_loss
+
+        return total_loss
+
+    def _compute_adapter_loss(self, model, common_data, advantages, adapter_name): # Not Sure
+        
         # When using num_iterations == 1 and steps_per_generation <= gradient_accumulation_steps
         # old_per_token_logps == per_token_logps, so we can skip it's computation
         # (see _generate_and_score_completions) and use per_token_logps.detach() instead.
@@ -184,7 +217,8 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
         self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
         gathered_clip_ratio = self.accelerator.gather(clip_ratio)
         self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
-        return losss
+
+        return loss
 
     def forward_process(self, batch, prompt_index, mask_id, seed=None):
         set_seed(seed)
@@ -353,17 +387,15 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
         top_p = float(self.args.top_p or 0.9)
         top_k = int(self.args.top_k or 50)
         repeat_penalty = float(self.args.repeat_penalty or 1.0)
-        num_main = int(self.num_generations)
-
-        # how many alt candidates in total from all diversity guidance
-        num_alt = int(self.num_generations * self.args.diversity_guidance_num)
-        diversity_guidance_num = int(self.args.diversity_guidance_num)
-
-        # cfg_scale = self.args.cfg_scale
+        num_main = int(self.args.num_candidates_main)
+        num_per_guidance = int(self.args.num_candidates_per_guidance)
 
         with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
             generation_batch_size = self.args.generation_batch_size # always set same as per_device_train_batch_size
-            prompt_completion_ids_all = []
+            all_generations = {"main": [], "guidance": {}}
+
+            for adapter_name in self.diversity_adapters:
+                all_generations["guidance"][adapter_name] = []
 
             # Process in batches
             for i in range(0, prompt_ids.size(0), generation_batch_size):
@@ -400,57 +432,74 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
                     pad_token_id=self.processing_class.eos_token_id, #
                 )
                 # main_outputs shape: (batch_size * num_main, seq_len)
-                prompt_completion_ids_all.append(main_outputs)
+                all_generations["main"].append(main_outputs)
 
                 # ==== 2. Diversity Guidance Generations (based on Diversity Guidance) ====
-                if len(diversity_adapters) > 0 and num_alt > 0:
-                    per_adapter = max(1, num_alt // len(diversity_adapters))
-                    for adapter_name in diversity_adapters:
+                for adapter_name in self.diversity_adapters:
+                    try:
+                        unwrapped_model.enable_adapter(adapter_name)
+                    except:
+                        pass
+                
+                    guidance_outputs = unwrapped_model.generate(
+                        input_ids=batch_prompt_ids,
+                        max_new_tokens=gen_length,
+                        do_sample=True,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k,
+                        repetition_penalty=repeat_penalty,
+                        num_return_sequences=num_per_guidance,
+                        return_dict_in_generate=False, # -> Get Tensor
+                        eos_token_id=self.processing_class.eos_token_id, #
+                        pad_token_id=self.processing_class.eos_token_id, #
+                    )
+                    all_generations["guidance"][adapter_name].append(guidance_outputs)
                         
-                    # Ensure that Diversity Guidance Adapter is enabled
-                    # ==== 2.a Diversity Guidance 1 ====
-                    try:
-                        unwrapped_model.enable_adapter("diversity_guidance_1")
-                    except:
-                        pass
+                    # # Ensure that Diversity Guidance Adapter is enabled
+                    # # ==== 2.a Diversity Guidance 1 ====
+                    # try:
+                    #     unwrapped_model.enable_adapter("diversity_guidance_1")
+                    # except:
+                    #     pass
 
-                    guidance1_outputs = unwrapped_model.generate(
-                        input_ids=batch_prompt_ids,
-                        max_new_tokens=gen_length,
-                        do_sample=True,
-                        temperature=temperature,
-                        top_p=top_p,
-                        top_k=top_k,
-                        repetition_penalty=repeat_penalty,
-                        num_return_sequences=per_adapter,
-                        return_dict_in_generate=False, # -> Get Tensor
-                        eos_token_id=self.processing_class.eos_token_id, #
-                        pad_token_id=self.processing_class.eos_token_id, #
-                    )
-                    prompt_completion_ids_all.append(guidance1_outputs)
+                    # guidance1_outputs = unwrapped_model.generate(
+                    #     input_ids=batch_prompt_ids,
+                    #     max_new_tokens=gen_length,
+                    #     do_sample=True,
+                    #     temperature=temperature,
+                    #     top_p=top_p,
+                    #     top_k=top_k,
+                    #     repetition_penalty=repeat_penalty,
+                    #     num_return_sequences=per_adapter,
+                    #     return_dict_in_generate=False, # -> Get Tensor
+                    #     eos_token_id=self.processing_class.eos_token_id, #
+                    #     pad_token_id=self.processing_class.eos_token_id, #
+                    # )
+                    # prompt_completion_ids_all.append(guidance1_outputs)
 
-                    # ==== 2.b Diversity Guidance 2 ====
-                    try:
-                        unwrapped_model.enable_adapter("diversity_guidance_2")
-                    except:
-                        pass
+                    # # ==== 2.b Diversity Guidance 2 ====
+                    # try:
+                    #     unwrapped_model.enable_adapter("diversity_guidance_2")
+                    # except:
+                    #     pass
 
-                    guidance2_outputs = unwrapped_model.generate(
-                        input_ids=batch_prompt_ids,
-                        max_new_tokens=gen_length,
-                        do_sample=True,
-                        temperature=temperature,
-                        top_p=top_p,
-                        top_k=top_k,
-                        repetition_penalty=repeat_penalty,
-                        num_return_sequences=per_adapter,
-                        return_dict_in_generate=False, # -> Get Tensor
-                        eos_token_id=self.processing_class.eos_token_id, #
-                        pad_token_id=self.processing_class.eos_token_id, #
-                    )
-                    prompt_completion_ids_all.append(guidance2_outputs)
+                    # guidance2_outputs = unwrapped_model.generate(
+                    #     input_ids=batch_prompt_ids,
+                    #     max_new_tokens=gen_length,
+                    #     do_sample=True,
+                    #     temperature=temperature,
+                    #     top_p=top_p,
+                    #     top_k=top_k,
+                    #     repetition_penalty=repeat_penalty,
+                    #     num_return_sequences=per_adapter,
+                    #     return_dict_in_generate=False, # -> Get Tensor
+                    #     eos_token_id=self.processing_class.eos_token_id, #
+                    #     pad_token_id=self.processing_class.eos_token_id, #
+                    # )
+                    # prompt_completion_ids_all.append(guidance2_outputs)
 
-                # Restore the main adapter after generation(Switch back to main adapter)
+                # Restore the main adapter after generation(SWITCH back to main adapter)
                 try:
                     unwrapped_model.set_adapter("main")
                 except:
@@ -460,8 +509,13 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
             del batch_prompt_ids
             torch.cuda.empty_cache()
         
-        # Concat all Generated Completions across Batches and Adapters
-        prompt_completion_ids = torch.cat(prompt_completion_ids_all, dim=0).to(device)
+        for batch_main in all_generations["main"]:
+            prompt_completion_ids_all.append(batch_main)
+
+        # Concat all generations
+        for adapter_name in self.diversity_adapters:
+            for batch_guidance in all_generations["guidance"][adapter_name]:
+                prompt_completion_ids_all.append(batch_guidance)
 
         # Compute prompt length and extract completion ids
         # At this point, 'prompt_completion_ids' a tensor of shape: (batch_size * num_generations, seq_len)
@@ -571,10 +625,40 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
         # Weighted Sum across reward functions (Ensure that reward_weights is on device)
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
 
-        # Ground-wise rewards (group side = self.num_generations + alt generations if any)
-        total_generations_per_prompt = (num_main + num_alt)
-        mean_grouped_rewards = rewards.view(-1, total_generations_per_prompt).mean(dim=1)
-        std_grouped_rewards = rewards.view(-1, total_generations_per_prompt).std(dim=1)
+        # Split Rewards per type of Generation Adapter
+        adapter_rewards = {}
+        start_idx = 0
+
+        # Main Adapter Rewards
+        end_idx = start_idx + len(prompts) * num_main
+        adapter_rewards["main"] = rewards[start_idx:end_idx]
+        start_idx = end_idx
+
+        # Guidance Adapters Rewards
+        for adapter_name in self.diversity_adapters:
+            end_idx = start_idx + len(prompts) * num_per_guidance
+            adapter_rewards[adapter_name] = rewards[start_idx:end_idx]
+            start_idx = end_idx
+        
+        adapter_advantages = {}
+
+        # Compute Advantages per Adapter
+        # Main
+        main_rewards_grouped = adapter_rewards["main"].view(-1, num_main)
+        main_mean_rewards = main_rewards_grouped.mean(dim=1)
+        adapter_advantages["main"] = adapter_rewards["main"] - main_mean_rewards.repeat_interleave(num_main, dim=0)
+        # Guidance
+        for adapter_name in self.diversity_adapters:
+            guidance_rewards_grouped = adapter_rewards[adapter_name].view(-1, num_per_guidance)
+            guidance_mean_rewards = guidance_rewards_grouped.mean(dim=1)
+            adapter_advantages["guidance"][adapter_name] = (
+                adapter_rewards["guidance"][adapter_name] - guidance_mean_rewards.repeat_interleave(num_per_guidance, dim=0)
+            )
+
+        # # Ground-wise rewards (group side = self.num_generations + alt generations if any)
+        # total_generations_per_prompt = (num_main + num_alt)
+        # mean_grouped_rewards = rewards.view(-1, total_generations_per_prompt).mean(dim=1)
+        # std_grouped_rewards = rewards.view(-1, total_generations_per_prompt).std(dim=1)
         
         # Normalize the rewards to compute the advantages
         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
@@ -692,11 +776,13 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
                 "old_per_token_logps": all_old_per_token_logps,
                 "ref_per_token_logps": all_ref_per_token_logps,
                 "mask_seeds": mask_seeds,
-            }
+            },
             "guidance": {
-                "base": {"advantages": advantages,}
-                "diversity_guidance_1": {"advantages": advantages,}
-                "diversity_guidance_2": {"advantages": advantages,}
+                "main": {"advantages": adapter_advantages["main"],}
+                "guidance": {
+                    adapter_name: {"advantages": adapter_advantages["guidance"][adapter_name],}
+                    for adapter_name in self.diversity_adapters
+                },
             }
         }
 
