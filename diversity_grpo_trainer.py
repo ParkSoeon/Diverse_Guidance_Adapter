@@ -2,7 +2,7 @@ import torch
 from trl.trainer.grpo_trainer import GRPOTrainer
 from typing import Any, Callable, Optional, Union, Sized
 import numpy as np
-from transformers import PreTrainedModel, PreTrainedTokenizerBase, TrainerCallback, Trainer
+from transformers import PreTrainedModel, PreTrainedTokenizerBase, TrainerCallback, Trainer, ProcessorMixin
 from datasets import Dataset, IterableDataset
 import warnings
 import torch.nn.functional as F
@@ -30,7 +30,7 @@ if is_peft_available():
 
 RewardFunc = Union[str, PretrainedModel, Callable[]] ##
 
-class CustomGuidanceGRPOTrainer(GRPOTrainer):  
+class GuidanceGRPOTrainer(GRPOTrainer):  
     def __init__(
         self,
         model: Union[str, PreTrainedModel],
@@ -63,9 +63,11 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
             peft_config=peft_config,
         )
 
+        self.diversity_adapters = getattr(self.args, "guidance_adapter_name", [])
+
         # Check if num of Candidates is consistent with num_generations and diversity guidance adapters
         total_candidates = (
-            self.args.num_candidates_main + self.args.num_candidates_per_guidance * self.args.num_diversity_adapters
+            self.args.num_candidates_main + self.args.num_candidates_per_guidance * len(self.diversity_adapters)
         )
         assert total_candidates == self.num_generations, (
             f"Total candidates ({total_candidates}) does not match num_generations ({self.num_generations}). "
@@ -135,22 +137,15 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
         # Guidance Adapters Losses
         for adapter_name in self.diversity_adapters:
             adapter_advantages = guidance_data["guidance"][adapter_name]["advantages"]
-            guidance_loss = self._compute_adapter_loss(model, per_token_logps, entropies, common_data, adapter_advantages)
+            guidance_loss = self._compute_adapter_loss(per_token_logps, entropies, common_data, adapter_advantages)
             total_loss += guidance_loss
         
         return total_loss
 
     def _compute_adapter_loss(self, per_token_logps, entropies, common_data, advantages): # Not Sure
-        prompt_ids = common_data["prompt_ids"]
-        prompt_mask = common_data["prompt_mask"]
-        completion_ids = common_data["completion_ids"]
         completion_mask = common_data["completion_mask"]
         old_per_token_logps = common_data["old_per_token_logps"]
         ref_per_token_logps = common_data["ref_per_token_logps"]
-
-        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
-        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
         if self.top_entropy_quantile < 1.0:
             entropy_mask = get_high_entropy_mask(entropies, completion_mask, 1 - self.top_entropy_quantile)
@@ -240,81 +235,26 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
 
         return loss
 
-    def get_logits(self, model, batch, prompt_index):
-        if cfg_scale > 0.0:
-            assert len(prompt_index) == batch.shape[1]
-            prompt_index = prompt_index.unsqueeze(0).repeat(batch.shape[0], 1)
-            un_batch = batch.clone()
-
-        input = batch
-        logits = model(input).logits
-
-        if cfg_scale > 0.0:
-            logits, un_logits = torch.chunk(logits, 2, dim=0)
-            logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+    def get_logits(self, model, input_ids):
+        logits = model(input_ids).logits
         return logits
 
-    def get_num_transfer_tokens(self, mask_index, steps):
-        """
-        Precompute the number of tokens to transition at each step.
-        Optimized to be more efficient.
-        """
-        mask_num = mask_index.sum(dim=1, keepdim=True)
-        base = mask_num // steps
-        remainder = mask_num % steps
-
-        # Create tensor once and modify in-place
-        num_transfer_tokens = base.expand(-1, steps).clone()
-
-        # Handle remainder more efficiently
-        if remainder.sum() > 0:
-            indices = torch.arange(steps, device=mask_index.device)
-            mask = indices.unsqueeze(0) < remainder
-            num_transfer_tokens[mask] += 1
-
-        return num_transfer_tokens.to(torch.int64)
-
-    def _get_per_token_logps(self, model, input_ids, logits_to_keep, mask_seeds):
+    def _get_per_token_logps(self, model, input_ids, logits_to_keep):
         """
         Calculate per-token log probabilities.
         """
-        num_iterations, batch_size, seq_len = input_ids.size()
-        device = input_ids.device
-        per_token_logps = torch.zeros(num_iterations, batch_size, logits_to_keep, device=device)
+        with torch.no_grad():
+            logits = model(input_ids).logits
 
-        # Verify mask_seeds length: one seed per iteration
-        assert (
-            len(mask_seeds) == num_iterations
-        ), f"Expected mask_seeds length to be {num_iterations}, got {len(mask_seeds)}"
+            # Extract Completion Logits (last_logits_to_keep tokens)
+            completion_logits = logits[:, -logits_to_keep - 1 : -1, :] # Shifting for next-token prediction
+            completion_targets = input_ids[:, -logits_to_keep:]
 
-        prompt_length = seq_len - logits_to_keep
-        prompt_index = torch.zeros(seq_len, dtype=torch.bool, device=device)
-        prompt_index[:prompt_length] = True  # Mark prompt tokens as True
+            log_probs = F.log_softmax(completion_logits, dim=-1)
+            per_token_logps = torch.gather(
+                log_probs, dim=-1, index=completion_targets.unsqueeze(-1)
+            ).squeeze(-1)
 
-        # Get model predictions for the combined batch
-        logits = self.get_logits(
-            model, prompt_index
-        )  # [num_iterations * batch_size, seq_len, vocab_size]
-
-        # Calculate cross-entropy loss for completion tokens only
-        completion_logits = logits[
-            :, -logits_to_keep:, :
-        ]  # [num_iterations * batch_size, logits_to_keep, vocab_size]
-        completion_targets = expanded_input[
-            :, -logits_to_keep:
-        ]  # [num_iterations * batch_size, logits_to_keep]
-        flat_logits = completion_logits.reshape(-1, completion_logits.size(-1))
-        flat_targets = completion_targets.reshape(-1)
-        loss = F.cross_entropy(flat_logits, flat_targets, reduction="none")
-
-        # Convert to log probabilities and reshape
-        completion_log_probs = -loss.view(num_iterations * batch_size, logits_to_keep)
-        per_token_logps = completion_log_probs.view(num_iterations, batch_size, logits_to_keep)
-
-        # Clean up memory
-        del logits
-        torch.cuda.empty_cache()
-        per_token_logps = per_token_logps.to(torch.float32)
         return per_token_logps
 
     def _prepare_inputs( # DO NOT CHANGE!!
@@ -516,20 +456,14 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
         # This process can be slow or expensive; keep generation batch size small to avoid OOM
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
-        # use fixed seeds for every iterations in GRPO iterations
-        mask_seeds = [42] * self.num_iterations
-
-        all_old_per_token_logps = []
-        all_ref_per_token_logps = []
+        all_old_per_token_logps = None
+        all_ref_per_token_logps = None
         
         with torch.no_grad():
             if self.num_iterations > 1:
                 # repeat prompt completion ids self.num_iterations times
-                prompt_completion_ids_expanded = prompt_completion_ids.unsqueeze(0).expand(
-                    self.num_iterations, -1, -1
-                )
                 old_per_token_logps = self._get_per_token_logps(
-                    self.model, prompt_completion_ids_expanded, logits_to_keep, mask_seeds
+                    self.model, prompt_completion_ids, logits_to_keep
                 )
                 all_old_per_token_logps = old_per_token_logps
             else:
@@ -541,7 +475,7 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
                 # Compute ref per-token log probabilities(logps) with adapters disabled
                 with self.accelerator.unwrap_model(self.model).disable_adapter():
                     ref_per_token_logps = self._get_per_token_logps(
-                        self.model, prompt_completion_ids_expanded, logits_to_keep, mask_seeds
+                        self.model, prompt_completion_ids_expanded, logits_to_keep
                     )
                     all_ref_per_token_logps = ref_per_token_logps
 
@@ -754,7 +688,6 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
                 "completion_mask": completion_mask,
                 "old_per_token_logps": all_old_per_token_logps,
                 "ref_per_token_logps": all_ref_per_token_logps,
-                "mask_seeds": mask_seeds,
             },
             "guidance": {
                 "main": {"advantages": adapter_advantages["main"]},
