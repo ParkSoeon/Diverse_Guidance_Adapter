@@ -89,8 +89,6 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
         common_data = inputs["common"]
         guidance_data = inputs["guidance"]
 
-        total_loss = 0.0
-
         prompt_ids = common_data["prompt_ids"]
         prompt_mask = common_data["prompt_mask"]
         completion_ids = common_data["completion_ids"]
@@ -101,47 +99,42 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
-        # Compute the per_token_logps and the entropy at each position in the completion
-        per_token_logps, entropies = self._get_per_token_logps_and_entropies(
-            model,
-            input_ids,
-            attention_mask,
-            logits_to_keep,
-            compute_entropy=True,
-            pixel_values=inputs.get("pixel_values"),
-            image_grid_thw=inputs.get("image_grid_thw"),
-            pixel_attention_mask=inputs.get("pixel_attention_mask"),
-            image_sizes=inputs.get("image_sizes"),
-        )
+        # # Compute the per_token_logps and the entropy at each position in the completion
+        # per_token_logps, entropies = self._get_per_token_logps_and_entropies(
+        #     model,
+        #     input_ids,
+        #     attention_mask,
+        #     logits_to_keep,
+        #     compute_entropy=True,
+        #     pixel_values=inputs.get("pixel_values"),
+        #     image_grid_thw=inputs.get("image_grid_thw"),
+        #     pixel_attention_mask=inputs.get("pixel_attention_mask"),
+        #     image_sizes=inputs.get("image_sizes"),
+        # )
 
-        if self.top_entropy_quantile < 1.0:
-            entropy_mask = get_high_entropy_mask(entropies, completion_mask, 1 - self.top_entropy_quantile)
-        else:
-            entropy_mask = None
+        common_loss_data = {
+            "per_token_logps": per_token_logps,
+            "entropies": entropies,
+            "completion_mask": completion_mask,
+            "old_per_token_logps": common_data.get("old_per_token_logps"),
+            "ref_per_token_logps": common_data.get("ref_per_token_logps"),
+        }
 
-        # Compute the KL divergence between the model and the reference model
-        if self.beta != 0.0:
-            ref_per_token_logps = inputs["ref_per_token_logps"]
-            per_token_kl = (
-                torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
-            )
+        total_loss = 0.0
 
-        # Compute the loss
-        advantages = inputs["advantages"]
-
-        main_advantages = guidance_data["main"]["advantages"]
-        main_loss = self._compute_adapter_loss(model, common_data, main_advantages, "main")
+        # Main
+        main_loss = self._compute_adapter_loss(per_token_logps, entropies, common_data, guidance_data["main"]["advantages"])
         total_loss += main_loss
 
-        # Guidance Adapters Losses
+        # Guidance Adapters
         for adapter_name in self.diversity_adapters:
             adapter_advantages = guidance_data["guidance"][adapter_name]["advantages"]
-            guidance_loss = self._compute_adapter_loss(model, common_data, adapter_advantages, adapter_name)
+            guidance_loss = self._compute_adapter_loss(per_token_logps, entropies, common_data, adapter_advantages)
             total_loss += guidance_loss
-
+        
         return total_loss
 
-    def _compute_adapter_loss(self, model, common_data, advantages, adapter_name): # Not Sure
+    def _compute_adapter_loss(self, per_token_logps, entropies, common_data, advantages): # Not Sure
         prompt_ids = common_data["prompt_ids"]
         prompt_mask = common_data["prompt_mask"]
         completion_ids = common_data["completion_ids"]
@@ -538,6 +531,15 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
             del batch_prompt_ids
             torch.cuda.empty_cache()
 
+        for batch_main in all_generations["main"]:
+            prompt_completion_ids_all.append(batch_main)
+
+        for adapter_name in self.diversity_adapters:
+            for batch_guidance in all_generations["guidance"][adapter_name]:
+                prompt_completion_ids_all.append(batch_guidance)
+
+        prompt_completion_ids = torch.cat(prompt_completion_ids_all, dim=0)
+
         # Concat all generations
         prompt_completion_ids_all = []
         
@@ -605,7 +607,8 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
 
         # ==== 3. Compute Rewards ====
         # Compute rewards for each completion with each reward function
-        rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
+        total_generations = len(prompts) * (num_main + num_per_guidance * len(self.diversity_adapters))
+        rewards_per_func = torch.zeros(total_generations, len(self.reward_funcs), device=device)
         for i, (reward_func, reward_processing_class) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes)
         ):
@@ -632,15 +635,6 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
                 ]
 
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
-
-        for batch_main in all_generations["main"]:
-            prompt_completion_ids_all.append(batch_main)
-
-        for adapter_name in self.diversity_adapters:
-            for batch_guidance in all_generations["guidance"][adapter_name]:
-                prompt_completion_ids_all.append(batch_guidance)
-
-        prompt_completion_ids = torch.cat(prompt_completion_ids_all, dim=0)
 
         # If all reward functions return None for a given row, issue a detailed warning
         if torch.isnan(rewards_per_func).all(dim=1).any():
@@ -686,7 +680,7 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
             guidance_rewards_grouped = adapter_rewards[adapter_name].view(-1, num_per_guidance)
             guidance_mean_rewards = guidance_rewards_grouped.mean(dim=1)
             adapter_advantages["guidance"][adapter_name] = (
-                adapter_rewards["guidance"][adapter_name] - guidance_mean_rewards.repeat_interleave(num_per_guidance, dim=0)
+                adapter_rewards[adapter_name] - guidance_mean_rewards.repeat_interleave(num_per_guidance, dim=0)
             )
 
         # Overall Mean and Std (for logging only)
@@ -699,7 +693,6 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
             self.accelerator.process_index * len(prompts),
             (self.accelerator.process_index + 1) * len(prompts),
         )
-        advantages = advantages[process_slice]
 
         # Metrics Logging        
         rewards_front_half = rewards[: len(rewards) // 2]
