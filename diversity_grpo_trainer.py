@@ -296,23 +296,48 @@ class GuidanceGRPOTrainer(GRPOTrainer):
             prompt_ids = prompt_ids[:, -self.max_prompt_length :]
             prompt_mask = prompt_mask[:, -self.max_prompt_length :]
 
-        # Configuration for Generation (use HF generate params)
-        gen_length = self.args.max_completion_length
-        temperature = float(self.args.temperature or 0.0)
-        top_p = float(self.args.top_p or 0.9)
-        top_k = int(self.args.top_k or 50)
-        repeat_penalty = float(self.args.repeat_penalty or 1.0)
-        num_main = int(self.args.num_candidates_main)
-        num_per_guidance = int(self.args.num_candidates_per_guidance)
+        generation_config = dict(
+            # Configuration for Generation (use HF generate params)
+            max_new_tokens=self.args.max_completion_length
+            temperature = float(self.args.temperature or 0.0)
+            top_p = float(self.args.top_p or 0.9)
+            top_k = int(self.args.top_k or 50)
+            repeat_penalty = float(self.args.repeat_penalty or 1.0)
+            num_main = int(self.args.num_candidates_main)
+            num_per_guidance = int(self.args.num_candidates_per_guidance)
+            eos_token_id = self.processing_class.eos_token_id
+            pad_token_id = self.processing_class.eos_token_id,
+        )
 
         prompt_completion_ids_all = []
 
+        all_generations = {"main": [], "guidance": {}}
+
         with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
             generation_batch_size = self.args.generation_batch_size # always set same as per_device_train_batch_size
-            all_generations = {"main": [], "guidance": {}}
+
+            if isinstance(model, PeftModel):
+                model.set_adapter("main")
+            
+            main_out = model.generate(input_ids, **generation_config, num_return_sequences=int(self.args.num_candidates_main))
+            all_generations["main"].append(main_out)
 
             for adapter_name in self.diversity_adapters:
+                try: 
+                    model.set_adapter(adapter_name)
+                except:
+                    logger.warning(f"Could not switch to adapter {adapter_name}. Make sure the adapter is loaded properly.")
+                    continue
+                guidance_out = model.generate(input_ids, **generation_config, num_return_sequences=int(self.args.num_candidates_per_guidance))
                 all_generations["guidance"][adapter_name] = []
+
+            if isinstance(model, PeftModel):
+                model.set_adapter("main")
+
+            all_tensors = [torch.cat(all_generations["main"], dim=0)]
+            for adapter_name in self.diversity_adapters:
+                for batch in all_generations["guidance"][adapter_name]:
+                    all_tensors.append(batch)
 
             # Process in batches
             for i in range(0, prompt_ids.size(0), generation_batch_size):
@@ -332,6 +357,7 @@ class GuidanceGRPOTrainer(GRPOTrainer):
                 # Ensure that Main Adpater is enabled
                 try: 
                     unwrapped_model.enable_adapter("main")
+                    logger.info(">> Switched to main adapter for generation. <<")
                 except:
                     pass
                 
@@ -350,11 +376,13 @@ class GuidanceGRPOTrainer(GRPOTrainer):
                 )
                 # main_outputs shape: (batch_size * num_main, seq_len)
                 all_generations["main"].append(main_outputs)
+                logger.info(f">> Generated {main_outputs.shape[0]} sequences with main adapter. <<")
 
                 # ==== 2. Diversity Guidance Generations (based on Diversity Guidance) ====
                 for adapter_name in self.diversity_adapters:
                     try:
                         unwrapped_model.enable_adapter(adapter_name)
+                        logger.info(f">> Switched to adapter {adapter_name} for generation. <<")
                     except:
                         pass
                 
@@ -372,53 +400,13 @@ class GuidanceGRPOTrainer(GRPOTrainer):
                         pad_token_id=self.processing_class.eos_token_id, #
                     )
                     all_generations["guidance"][adapter_name].append(guidance_outputs)
-                        
-                    # # Ensure that Diversity Guidance Adapter is enabled
-                    # # ==== 2.a Diversity Guidance 1 ====
-                    # try:
-                    #     unwrapped_model.enable_adapter("diversity_guidance_1")
-                    # except:
-                    #     pass
-
-                    # guidance1_outputs = unwrapped_model.generate(
-                    #     input_ids=batch_prompt_ids,
-                    #     max_new_tokens=gen_length,
-                    #     do_sample=True,
-                    #     temperature=temperature,
-                    #     top_p=top_p,
-                    #     top_k=top_k,
-                    #     repetition_penalty=repeat_penalty,
-                    #     num_return_sequences=per_adapter,
-                    #     return_dict_in_generate=False, # -> Get Tensor
-                    #     eos_token_id=self.processing_class.eos_token_id, #
-                    #     pad_token_id=self.processing_class.eos_token_id, #
-                    # )
-                    # prompt_completion_ids_all.append(guidance1_outputs)
-
-                    # # ==== 2.b Diversity Guidance 2 ====
-                    # try:
-                    #     unwrapped_model.enable_adapter("diversity_guidance_2")
-                    # except:
-                    #     pass
-
-                    # guidance2_outputs = unwrapped_model.generate(
-                    #     input_ids=batch_prompt_ids,
-                    #     max_new_tokens=gen_length,
-                    #     do_sample=True,
-                    #     temperature=temperature,
-                    #     top_p=top_p,
-                    #     top_k=top_k,
-                    #     repetition_penalty=repeat_penalty,
-                    #     num_return_sequences=per_adapter,
-                    #     return_dict_in_generate=False, # -> Get Tensor
-                    #     eos_token_id=self.processing_class.eos_token_id, #
-                    #     pad_token_id=self.processing_class.eos_token_id, #
-                    # )
-                    # prompt_completion_ids_all.append(guidance2_outputs)
+                    logger.info(f">> Generated {guidance_outputs.shape[0]} sequences with adapter {adapter_name}. <<")
+                    logger.info(f">> Generated {num_per_guidance} Candidates for Each Prompt with adapter {adapter_name}. <<")
 
                 # Restore the main adapter after generation(SWITCH back to main adapter)
                 try:
                     unwrapped_model.set_adapter("main")
+                    logger.info(">> Restored to main adapter after guidance generations. <<")
                 except:
                     pass
             
@@ -428,10 +416,12 @@ class GuidanceGRPOTrainer(GRPOTrainer):
 
         for batch_main in all_generations["main"]:
             prompt_completion_ids_all.append(batch_main)
+            logger.info(f">> Appended {batch_main.shape[0]} main generations to the list. <<")
 
         for adapter_name in self.diversity_adapters:
             for batch_guidance in all_generations["guidance"][adapter_name]:
                 prompt_completion_ids_all.append(batch_guidance)
+                logger.info(f">> Appended {batch_guidance.shape[0]} guidance generations from adapter {adapter_name} to the list. <<")
 
         prompt_completion_ids = torch.cat(prompt_completion_ids_all, dim=0)
 
