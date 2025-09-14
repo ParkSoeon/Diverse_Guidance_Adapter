@@ -360,7 +360,7 @@ def main(script_args, training_args, model_args):
     #############################
     # Initialize the GRPO trainer
     #############################
-    trainer = GuidanceGRPOTrainer(
+    trainer = CustomGuidanceGRPOTrainer(
         model=model,
         reward_funcs=all_reward_funcs,
         args=training_args,
