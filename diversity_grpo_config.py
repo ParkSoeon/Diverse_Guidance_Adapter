@@ -447,15 +447,9 @@ class GRPOConfig(TrainingArguments):
             "help": "Number of candidate generations to use for the main model."
         },
     )
-    num_candidates_guidance: int = field(
+    num_candidates_per_guidance: int = field(
         default=2,
         metadata={
             "help": "Number of candidate generations to use for each guidance adapter."
-        },
-    )
-    guidance_adapter_name: Optional[str] = field(
-        default=["diversity_guidance_1", "diversity_guidance_2"],
-        metadata={
-            "help": "Name of the guidance adapter to use. If `None` (default), a default adapter is used."
         },
     )
