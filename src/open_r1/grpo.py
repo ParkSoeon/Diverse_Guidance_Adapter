@@ -23,14 +23,14 @@ import torch
 import transformers
 from datasets import load_dataset
 from transformers import set_seed, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, set_peft_model_state
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training#, set_peft_model_state
     # "set_peft_model_state" is for loading LoRA weights for each Adapter
 from transformers.trainer_utils import get_last_checkpoint
 
 # from open_r1.configs import GRPOConfig
 from diversity_grpo_config import GRPOConfig 
 
-from open_r1.rewards import (
+from rewards import (
     accuracy_reward,
     code_reward,
     format_reward,
@@ -41,9 +41,9 @@ from open_r1.rewards import (
     reasoning_steps_reward,
     tag_count_reward,
 )
-from open_r1.utils import get_tokenizer
-from open_r1.utils.callbacks import get_callbacks
-from open_r1.utils.wandb_logging import init_wandb_training
+from utils import get_tokenizer
+from utils.callbacks import get_callbacks
+from utils.wandb_logging import init_wandb_training
 # from trl import GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
 from trl import ModelConfig, ScriptArguments, TrlParser, get_peft_config
 from custom_diversity_grpo_trainer import CustomGuidanceGRPOTrainer # 
@@ -121,15 +121,15 @@ class GRPOScriptArguments(ScriptArguments):
 
     ###
     # Multi-adapter configuration
-    num_guidance_adapters: int = field(
+    _num_guidance_adapters: int = field(
         default=2,
         metadata={"help": "Number of guidance adapters for diversity"}
     )
-    num_candidates_main: int = field(
+    _num_candidates_main: int = field(
         default=6,
         metadata={"help": "Number of candidates from main adapter (accuracy focused)"}
     )
-    num_candidates_per_guidance: int = field(
+    _num_candidates_per_guidance: int = field(
         default=2,
         metadata={"help": "Number of candidates per guidance adapter (diversity focused)"}
     )
@@ -166,7 +166,7 @@ def setup_multi_adapter_model(model, script_args):
     model = prepare_model_for_kbit_training(model)
 
     # Add Multi Guidance Adapters
-    for i in range(script_args.num_guidance_adapters):
+    for i in range(script_args._num_guidance_adapters):
         adapter_name = f"diversity_guidance_adapter_{i}"
 
         # Newly create LoRA Config for multi Guidance Adapter
@@ -179,7 +179,7 @@ def setup_multi_adapter_model(model, script_args):
         )
 
         # Add new adapter to the model
-        model.add_adapter(adapter_name, config=guidance_lora_config)
+        model.add_adapter(adapter_name, guidance_lora_config)
         logger.info(f"Added adapter: {adapter_name}")
 
     model.print_trainable_parameters()
@@ -187,8 +187,8 @@ def setup_multi_adapter_model(model, script_args):
     # Set back to Default Adapter (Main)
     model.set_adapter("main")
 
-    logger.info(f"Model setup with {script_args.num_guidance_adapters} guidance adapters.")
-    logger.info(f"Model setup complete with {script_args.num_guidance_adapters + 1}")
+    logger.info(f"Model setup with {script_args._num_guidance_adapters} guidance adapters.")
+    logger.info(f"Model setup complete with {script_args._num_guidance_adapters + 1}")
     model.print_trainable_parameters()
 
     return model
@@ -351,11 +351,11 @@ def main(script_args, training_args, model_args):
 
     # Sepup Training Arguments for Multi-Adapter
     training_args.guidance_adapter_names = [
-        f"diversity_guidance_adapter_{i}" for i in range(script_args.num_guidance_adapters)
+        f"diversity_guidance_adapter_{i}" for i in range(script_args._num_guidance_adapters)
     ]
-    training_args.num_guidance_adapters = script_args.num_guidance_adapters
-    training_args.num_candidates_main = script_args.num_candidates_main
-    training_args.num_candidates_per_guidance = script_args.num_candidates_per_guidance
+    training_args._num_guidance_adapters = script_args._num_guidance_adapters
+    training_args._num_candidates_main = script_args._num_candidates_main
+    training_args._num_candidates_per_guidance = script_args._num_candidates_per_guidance
 
     #############################
     # Initialize the GRPO trainer
@@ -381,7 +381,8 @@ def main(script_args, training_args, model_args):
         checkpoint = training_args.resume_from_checkpoint
     elif last_checkpoint is not None:
         checkpoint = last_checkpoint
-    train_result = trainer.train(resume_from_checkpoint=checkpoint)
+    # train_result = trainer.train(resume_from_checkpoint=checkpoint)
+    train_result = trainer.train(resume_from_checkpoint=None)
     metrics = train_result.metrics
     metrics["train_samples"] = len(dataset[script_args.dataset_train_split])
     trainer.log_metrics("train", metrics)
@@ -395,7 +396,7 @@ def main(script_args, training_args, model_args):
     trainer.save_model(training_args.output_dir)  # Saves the tokenizer too for easy upload
 
     # Save each adapter separately!!!!
-    for i in range(script_args.num_guidance_adapters):
+    for i in range(script_args._num_guidance_adapters):
         adapter_name = f"diversity_guidance_adapter_{i}"
         adapter_dir = os.path.join(training_args.output_dir, f"adapter_{adapter_name}")
         model.save_pretrained(adapter_dir, adapter_name=[adapter_name])
