@@ -100,18 +100,6 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
-        # Compute the per_token_logps and the entropy at each position in the completion
-        # per_token_logps, entropies = self._get_per_token_logps_and_entropies(
-        #     model,
-        #     input_ids,
-        #     attention_mask,
-        #     logits_to_keep,
-        #     compute_entropy=True,
-        #     pixel_values=inputs.get("pixel_values"),
-        #     image_grid_thw=inputs.get("image_grid_thw"),
-        #     pixel_attention_mask=inputs.get("pixel_attention_mask"),
-        #     image_sizes=inputs.get("image_sizes"),
-        # )
         per_token_logps, entropies = self._get_per_token_logps_and_entropies(
             model,
             input_ids,
