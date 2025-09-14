@@ -100,18 +100,6 @@ class GuidanceGRPOTrainer(GRPOTrainer):
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
-        # Compute the per_token_logps and the entropy at each position in the completion
-        # per_token_logps, entropies = self._get_per_token_logps_and_entropies(
-        #     model,
-        #     input_ids,
-        #     attention_mask,
-        #     logits_to_keep,
-        #     compute_entropy=True,
-        #     pixel_values=inputs.get("pixel_values"),
-        #     image_grid_thw=inputs.get("image_grid_thw"),
-        #     pixel_attention_mask=inputs.get("pixel_attention_mask"),
-        #     image_sizes=inputs.get("image_sizes"),
-        # )
         per_token_logps, entropies = self._get_per_token_logps_and_entropies(
             model,
             input_ids,
@@ -659,17 +647,6 @@ class GuidanceGRPOTrainer(GRPOTrainer):
             
             append_jsonl(f"{self.args.output_dir}/results.jsonl", result)                
 
-        # Final Return with Dict(A single dict) -- keeping old/ref per-token if needed
-        # return { 
-        #     "prompt_ids": prompt_ids,
-        #     "prompt_mask": prompt_mask,
-        #     "completion_ids": completion_ids,
-        #     "completion_mask": completion_mask,
-        #     "old_per_token_logps": all_old_per_token_logps,
-        #     "ref_per_token_logps": all_ref_per_token_logps,
-        #     "advantages": advantages,
-        #     "mask_seeds": mask_seeds,  # Store all mask seeds for consistent mask patterns
-        # }
         return {
             "common": {
                 "prompt_ids": prompt_ids,
