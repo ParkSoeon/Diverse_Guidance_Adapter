@@ -1,3 +1,5 @@
+# FLAG: 표시 확인하고 검토받기..
+
 import torch
 from trl.trainer.grpo_trainer import GRPOTrainer
 from typing import Any, Callable, Optional, Union, Sized
@@ -7,10 +9,11 @@ from datasets import Dataset, IterableDataset
 import warnings
 import torch.nn.functional as F
 from trl.trainer.grpo_config import GRPOConfig
+# from trl.extras.profiling import profiling_decorator, profiling_context
 from trl.extras.profiling import profiling_decorator, profiling_context
 from transformers.utils import is_peft_available
 from torch import nn
-from trl.import_utils import is_rich_available, is_vllm_available
+from trl.import_utils import is_rich_available
 from accelerate.utils import broadcast_object_list, gather, gather_object, is_peft_model, set_seed
 from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
@@ -18,17 +21,16 @@ from trl.trainer.utils import (
     generate_model_card,
     get_comet_experiment_url,
     pad,
-    print_prompt_completions_sample,
     selective_log_softmax,
-    get_high_entropy_mask,
-    nanmin, nanmax
+    # get_high_entropy_mask,
+    # nanmin, nanmax
 )
 import wandb
 
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
 
-RewardFunc = Union[str, PretrainedModel, Callable[]] ##
+RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
 
 class CustomGuidanceGRPOTrainer(GRPOTrainer):  
     def __init__(
@@ -40,7 +42,7 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
         eval_dataset: Optional[
             Union[Dataset, IterableDataset, dict[str, Union[Dataset, IterableDataset]]]
         ] = None,
-        processing_class: Optional[Union[PreTrainedTokenizerBase, ProcessorMixin]] = None,
+        processing_class: Optional[PreTrainedTokenizerBase] = None,
         reward_processing_classes: Optional[
             Union[PreTrainedTokenizerBase, list[PreTrainedTokenizerBase]]
         ] = None,
@@ -64,6 +66,9 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
         )
 
         self.diversity_adapters = getattr(self.args, "guidance_adapter_names", [])
+        self.max_completion_length = self.args.max_completion_length
+        self.scale_rewards = getattr(self.args, "scale_rewards", True)
+        self.loss_type = getattr(self.args, "loss_type", "grpo")
 
         # Check if num of Candidates is consistent with num_generations and diversity guidance adapters
         total_candidates = (
@@ -130,15 +135,29 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
 
         total_loss = 0.0
 
-        # Main Adapter Loss
-        main_loss = self._compute_adapter_loss(per_token_logps, entropies, common_data, guidance_data["main"]["advantages"])
-        total_loss += main_loss
+        for adapter_type, adapter_data in guidance_data.items():
+            if adapter_type == "main":
+                model.set_adapter("main")
+                adapter_loss = self._compute_adapter_loss(
+                    model, common_data, adapter_data
+                )
+                total_loss += adapter_loss
+            else:
+                for adapter_name, adapter_info in adapter_data.items():
+                    model.set_adapter(adapter_name)
+                    adapter_loss = self._compute_adapter_loss(
+                        model, common_data, adapter_info
+                    )
+                    total_loss += adapter_loss
+        # # Main Adapter Loss
+        # main_loss = self._compute_adapter_loss(per_token_logps, entropies, common_data, guidance_data["main"]["advantages"])
+        # total_loss += main_loss
 
-        # Guidance Adapters Losses
-        for adapter_name in self.diversity_adapters:
-            adapter_advantages = guidance_data["guidance"][adapter_name]["advantages"]
-            guidance_loss = self._compute_adapter_loss(per_token_logps, entropies, common_data, adapter_advantages)
-            total_loss += guidance_loss
+        # # Guidance Adapters Losses
+        # for adapter_name in self.diversity_adapters:
+        #     adapter_advantages = guidance_data["guidance"][adapter_name]["advantages"]
+        #     guidance_loss = self._compute_adapter_loss(per_token_logps, entropies, common_data, adapter_advantages)
+        #     total_loss += guidance_loss
         
         return total_loss
 
@@ -181,6 +200,8 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
         # Two-sided clipping
         if self.args.delta is not None:
             coef_1 = torch.clamp(coef_1, max=self.args.delta)
+
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         per_token_loss1 = coef_1 * advantages.unsqueeze(1)
         per_token_loss2 = coef_2 * advantages.unsqueeze(1)
@@ -226,10 +247,10 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
 
         gathered_low_clip = self.accelerator.gather(low_clip)
         self._metrics[mode]["clip_ratio/low_mean"].append(gathered_low_clip.nanmean().item())
-        self._metrics[mode]["clip_ratio/low_min"].append(nanmin(gathered_low_clip).item())
+        self._metrics[mode]["clip_ratio/low_min"].append(np.nanmin(gathered_low_clip).item())
         gathered_high_clip = self.accelerator.gather(high_clip)
         self._metrics[mode]["clip_ratio/high_mean"].append(gathered_high_clip.nanmean().item())
-        self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
+        self._metrics[mode]["clip_ratio/high_max"].append(np.nanmax(gathered_high_clip).item())
         gathered_clip_ratio = self.accelerator.gather(clip_ratio)
         self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
 
@@ -280,17 +301,8 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
 
         # Extract Solutions from inputs
         prompts = [x["prompt"] for x in inputs]
-        solutions = [x.get["solution"] for x in inputs] # Reference Solutions
+        solutions = [x.get("solution") for x in inputs] # Reference Solutions
         answers = [x.get("answer", "") for x in inputs] # Target Answers
-
-        # # Configuration for the Generation
-        # gen_length = self.args.max_completion_length
-        # temperature = float(self.args.temperature or 0.0)
-        # top_p = float(self.args.top_p or 0.9)
-        # top_k = int(self.args.top_k or 50)
-        # repeat_penalty = float(self.args.repeat_penalty or 1.0)
-        # num_main = int(self.args.num_candidates_main)
-        # num_per_guidance = int(self.args.num_candidates_per_guidance)
 
         prompts_text = [
             maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs
@@ -322,16 +334,24 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
 
         generation_config = dict(
             # Configuration for Generation (use HF generate params)
-            max_new_tokens = self.args.max_completion_length
-            temperature = float(self.args.temperature or 0.0)
-            top_p = float(self.args.top_p or 0.9)
-            top_k = int(self.args.top_k or 50)
-            repetition_penalty = float(self.args.repeat_penalty or 1.0)
-            # num_main = int(self.args.num_candidates_main)
-            # num_per_guidance = int(self.args.num_candidates_per_guidance)
-            return_dict_in_generate = False, # -> Get Tensor
-            eos_token_id = self.processing_class.eos_token_id
-            pad_token_id = self.processing_class.eos_token_id,
+            "max_new_tokens" == self.args.max_completion_length,
+            "temperature" == float(self.args.temperature or 0.0),
+            "top_p" ==float(self.args.top_p or 0.9),
+            "top_k" ==int(self.args.top_k or 50),
+            "repetition_penalty" == float(self.args.repeat_penalty or 1.0),
+            "num_main" == int(self.args.num_candidates_main),
+            "num_per_guidance" == int(self.args.num_candidates_per_guidance),
+            "return_dict_in_generate" == False, # -> Get Tensor
+            "eos_token_id" == self.processing_class.eos_token_id,
+            "pad_token_id" == self.processing_class.eos_token_id,
+        )
+        
+        num_generations_per_prompt = (
+            self.args.num_candidates_main + 
+            self.args.num_candidates_per_guidance * len(self.diversity_adapters)
+        )
+        prompt_completion_ids_expanded = prompt_completion_ids.repeat_interleave(
+            repeats = 1, dim = 0
         )
         
         all_generations = {"main": [], "guidance": {}}
@@ -494,6 +514,16 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
 
         # Reset of the Reward and Advantage Computation
         rewards_per_func = self.accelerator.gather(rewards_per_func)
+
+        # FLAG
+        # Reward Scailing (if needed..... Need to be reviewed.....)
+        if self.args.reward_scaling:
+            # Scale each reward function separately by its std
+            for i in range(rewards_per_func.shape[1]):
+                reward_std = rewards_per_func[:, i].std()
+                if reward_std > 1e-6: # Avoid division by zero
+                    rewards_per_func[:, i] = rewards_per_func[:, i] / reward_std
+
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
 
         # Split Rewards per type of Generation Adapter
@@ -518,6 +548,13 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
         adapter_advantages["main"] = (
             adapter_rewards["main"] - main_mean_rewards.repeat_interleave(self.args.num_candidates_main, dim=0)
         )
+        # FLAG
+        # Normalize Advantages
+        if adapter_advantages["main"].std() > 1e-6:
+            adapter_advantages["main"] = (
+                (adapter_advantages["main"] - adapter_advantages["main"].mean()) / 
+                adapter_advantages["main"].std() + 1e-6
+            )
         # Guidance Advantages
         for adapter_name in self.diversity_adapters:
             guidance_rewards_grouped = adapter_rewards["guidance"][adapter_name].view(-1, self.args.num_candidates_per_guidance)
@@ -525,11 +562,19 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
             adapter_advantages["guidance"][adapter_name] = (
                 adapter_rewards["guidance"][adapter_name] - guidance_mean_rewards.repeat_interleave(self.args.num_candidates_per_guidance, dim=0)
             )
+            # FLAG
+            # Normalize Advantages
+            current_advantages = adapter_advantages["guidance"][adapter_name]   
+            if current_advantages.std() > 1e-6:
+                adapter_advantages["guidance"][adapter_name] = (
+                    (current_advantages - current_advantages.mean()) / 
+                    (current_advantages.std() + 1e-6)
+                )
 
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
         all_old_per_token_logps = None
         all_ref_per_token_logps = None
-        
+
         with torch.no_grad():
             if self.num_iterations > 1:
                 # repeat prompt completion ids self.num_iterations times
@@ -649,7 +694,9 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
                 is_front_half=False
             )
             
-            append_jsonl(f"{self.args.output_dir}/results.jsonl", result)                
+            append_jsonl(f"{self.args.output_dir}/results.jsonl", result)       
+
+        expandeded_prompt_mask = torch.cat([prompt_mask] * (prompt_completion_ids.size(0) // len(prompts)), dim=0)
 
         # Final Return with Dict(A single dict) -- keeping old/ref per-token if needed
         # return { 
@@ -664,8 +711,8 @@ class CustomGuidanceGRPOTrainer(GRPOTrainer):
         # }
         return {
             "common": {
-                "prompt_ids": prompt_ids_expanded,
-                "prompt_mask": torch.cat([prompt_mask] * (prompt_completion_ids.size(0) // len(prompts)), dim=0),
+                "prompt_ids": prompt_ids,
+                "prompt_mask": expanded_prompt_mask, 
                 "completion_ids": completion_ids,
                 "completion_mask": completion_mask,
                 "old_per_token_logps": all_old_per_token_logps,
