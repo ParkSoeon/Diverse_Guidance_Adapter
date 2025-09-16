@@ -51,6 +51,7 @@ from src.open_r1.custom_drgrpo_trainer import CustomGuidanceGRPOTrainer
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class GRPOScriptArguments(ScriptArguments):
     """
@@ -249,8 +250,7 @@ def main(script_args, training_args, model_args):
     tokenizer.pad_token = tokenizer.eos_token
     model.config.use_cache = False
 
-    # model = prepare_model_for_kbit_training(model)
-    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
+    model = prepare_model_for_kbit_training(model)
 
     # Configure LoRA for parameter-efficient fine-tuning
     peft_config = LoraConfig(
@@ -268,7 +268,7 @@ def main(script_args, training_args, model_args):
     for i in range(int(training_args.num_guidance_adapters)):
         adapter_name = f"diversity_guidance_adapter_{i}"
         model.add_adapter(adapter_name, peft_config)
-        logger.info(f">> Added adapter: {adapter_name}")
+        logger.info(f"Added adapter: {adapter_name}")
 
     #############################
     # Initialize the DRGRPO trainer
@@ -286,8 +286,6 @@ def main(script_args, training_args, model_args):
         callbacks=get_callbacks(training_args, model_args),
         processing_class=tokenizer,
     )
-    trainer.model.config.use_cache = False
-    trainer.model.gradient_checkpointing_enable()
 
     ###############
     # Training loop
@@ -298,7 +296,7 @@ def main(script_args, training_args, model_args):
         checkpoint = training_args.resume_from_checkpoint
     elif last_checkpoint is not None:
         checkpoint = last_checkpoint
-    train_result = trainer.train() #(resume_from_checkpoint=None)
+    train_result = trainer.train(resume_from_checkpoint=None)
     metrics = train_result.metrics
     metrics["train_samples"] = len(dataset[script_args.dataset_train_split])
     trainer.log_metrics("train", metrics)
