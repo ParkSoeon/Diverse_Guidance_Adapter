@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import logging
 import textwrap
 import warnings
 from collections import defaultdict
@@ -27,7 +28,8 @@ from accelerate.utils.other import is_compiled_module
 from datasets import Dataset, IterableDataset
 from packaging import version
 from torch import nn
-from torch.utils.data import Sampler
+from torch.utils.data import Sampler, Dataset
+
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForSequenceClassification,
@@ -51,7 +53,11 @@ from src.open_r1.trl.trainer.utils import (
     pad,
     selective_log_softmax,
 )
-from src.open_r1.trl.data_utils import maybe_apply_chat_template
+from src.open_r1.trl.data_utils import (
+    maybe_apply_chat_template,
+    apply_chat_template,
+    is_conversational
+    )
  
 from sentence_transformers import SentenceTransformer
 # from FlagEmbedding import BGEM3FlagModel 
@@ -60,6 +66,7 @@ from transformers import AutoModel
 
 import torch.nn.functional as F
 
+logger = logging.getLogger(__name__)
 
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
@@ -351,6 +358,13 @@ class CustomGuidanceGRPOTrainer(Trainer):
         # Initialize the metrics
         self._metrics = defaultdict(list)
         self.log_completions = args.log_completions
+        self.num_guidance_adapters = args.num_guidance_adapters
+        self.guidance_adapter_names = args.guidance_adapter_names
+        self.num_candidates_main = args.num_candidates_main
+        self.num_candidates_per_guidance = args.num_candidates_per_guidance
+        self.generation_batch_size = args.generation_batch_size
+        self.num_iterations = args.num_iterations
+        self.num_guidance_adapters = args.num_guidance_adapters
 
         super().__init__(
             model=model,
@@ -485,12 +499,17 @@ class CustomGuidanceGRPOTrainer(Trainer):
         if self._signature_columns is None:
             self._signature_columns = ["prompt"]
 
-    def _get_train_sampler(self) -> Sampler:
+    def _get_train_sampler(self, train_dataset: Optional[Dataset] = None) -> Optional[Sampler]:
         # Returns a sampler that ensures each prompt is repeated across multiple processes. This guarantees that
         # identical prompts are distributed to different GPUs, allowing rewards to be computed and normalized correctly
         # within each prompt group. Using the same seed across processes ensures consistent prompt assignment,
         # preventing discrepancies in group formation.
-        return RepeatRandomSampler(self.train_dataset, self.num_generations, seed=self.args.seed)
+
+        if train_dataset is None:
+            train_dataset = self.train_dataset
+        if train_dataset is None:
+            return None
+        return RepeatRandomSampler(train_dataset, self.num_generations, seed=self.args.seed)
 
     def _get_eval_sampler(self, eval_dataset) -> Sampler:
         # Returns a sampler that ensures each prompt is repeated across multiple processes. This guarantees that
@@ -543,6 +562,39 @@ class CustomGuidanceGRPOTrainer(Trainer):
                 unwrapped_model.unmerge_adapter()
 
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
+
+        # [4DBG] Check for the REAL number of adapters -- successfully loaded (including default)
+        if not hasattr(self, '_adapters_checked'):
+
+            # [4DBG] check loaded adapters
+            def _check_loaded_adapters(self):
+                logger.info("="*50)
+                logger.info(">> Checking loaded adapters... <<")
+
+                if hasattr(self.model, 'peft_config'):
+                    loaded_adapters = list(self.model.peft_config.keys())
+                    logger.info(f"Loaded adapters: {loaded_adapters}")
+                    logger.info(f"Activate Adapter: {self.model.active_adapter}")
+
+                    if "default" not in loaded_adapters:
+                        logger.warning(f"[[WARNING]] The default adapter is not loaded. Make sure to load it properly.")
+
+                    available_guidance_adapters = [name for name in self.guidance_adapter_names if name in loaded_adapters]
+                    logger.info(f"Available Guidance Adapters: {available_guidance_adapters}")
+
+                    self.args.guidance_adapter_names = available_guidance_adapters
+
+                else:
+                    logger.warning(f"[[WARNING]] The model does not have any adapters loaded. Make sure to load them properly.")
+                    self.args.guidance_adapter_names = []
+
+                logger.info(f"Final Adapter Count: {len(self.guidance_adapter_names)}")
+                logger.info("="*50)
+                
+            self._adapters_checked = True
+
+            _check_loaded_adapters(self)
+            
         device = self.accelerator.device
         prompts = [x["prompt"] for x in inputs]
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
@@ -557,7 +609,7 @@ class CustomGuidanceGRPOTrainer(Trainer):
             prompt_mask = prompt_mask[:, -self.max_prompt_length :]
 
         # Generate completions using either vLLM or regular generation
-        if self.args.use_vllm:
+        if self.args.use_vllm == True:
             raise NotImplementedError("vLLM generation is not implemented in this version.")
             # First, have main process load weights if needed
             if self.state.global_step != self._last_loaded_step:
@@ -589,17 +641,21 @@ class CustomGuidanceGRPOTrainer(Trainer):
             # Regular generation path
             all_generations = {"main": [], "guidance": {}}
             with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
-                generation_batch_size = self.args.generation_batch_size
+                generation_batch_size = self.generation_batch_size
                 prompt_completion_ids = unwrapped_model.generate(
                     prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
                 )
 
+                print(f">> Generation batch size: {generation_batch_size} <<")
+                print(f">> Total number of candidates to be generated per data: {self.num_generations} <<")
+                print(f">> Number of prompts in the current batch: {prompt_ids.size(0)} <<")
+
+                # ==== 1. Main Adapter Generations(based on Accuracy--openrs baseline) ====
                 for i in range(0, self.args.num_candidates_main, generation_batch_size):
                     end_idx = min(i + generation_batch_size, prompt_ids.size(0))
                     batch_prompt_ids = prompt_ids[i:end_idx].to(device)
                     # batch_size = batch_prompt_ids.size(0)
 
-                    # ==== 1. Main Adapter Generations(based on Accuracy--openrs baseline) ====
                     try:
                         unwrapped_model.set_adapter("default")
                         logger.info(">> Switched to Main Adapter for generation. <<")
@@ -614,13 +670,15 @@ class CustomGuidanceGRPOTrainer(Trainer):
                     all_generations["main"].append(main_outputs)
                     logger.info(f">> Generated {main_outputs.shape[0]} sequences with main adapter. <<")
 
-                for adapter_name in self.diversity_adapters:
+                # ==== 2. Diversity Guidance Generations (based on Diversity Guidance) ====
+                for adapter_name in self.guidance_adapter_names:
+                    all_generations["guidance"][adapter_name] = []
+
                     for i in range(0, self.args.num_candidates_per_guidance, generation_batch_size):
                         end_idx = min(i + generation_batch_size, prompt_ids.size(0))
                         batch_prompt_ids = prompt_ids[i:end_idx].to(device)
                         # batch_size = batch_prompt_ids.size(0)
 
-                        # ==== 2. Diversity Guidance Generations (based on Diversity Guidance) ====
                         try:
                             unwrapped_model.set_adapter(adapter_name)
                             logger.info(f">> Switched to adapter {adapter_name} for generation. <<")
@@ -633,6 +691,7 @@ class CustomGuidanceGRPOTrainer(Trainer):
                             generation_config=self.generation_config,
                         )
                         all_generations["guidance"][adapter_name].append(guidance_outputs)
+                        all_generations["guidance"][adapter_name] = []
                         logger.info(f">> Generated {guidance_outputs.shape[0]} sequences with adapter {adapter_name}. <<")
                         logger.info(f">> Generated {self.args.num_candidates_per_guidance} Candidates for Each Prompt with adapter {adapter_name}. <<")
 
@@ -657,40 +716,101 @@ class CustomGuidanceGRPOTrainer(Trainer):
             for batch_main in all_generations["main"]:
                 prompt_completion_ids_all.append(batch_main)
             # Then Add Guidance Generations
-            for adapter_name in self.diversity_adapters:
+            for adapter_name in self.guidance_adapter_names:
                 # prompt_completion_ids_all_diversity[adapter_name] = torch.cat(all_generations["guidance"][adapter_name], dim=0)
                 for batch_guidance in all_generations["guidance"][adapter_name]:
                     prompt_completion_ids_all.append(batch_guidance)
 
-            main_completion_index = torch.arange(0, self.args.num_generations, device=device) < self.args.num_generation # self.args.num_candidates_main
+            main_completion_index = torch.arange(0, self.args.num_generations, device=device) < self.args.num_generations # self.args.num_candidates_main
             guidance_completion_index = {}
-            for ani, adapter_name in enumerate(self.diversity_adapters):
-                guidance_completion_index[adapter_name] = self.args.num_candidates_main + ani * self.args.num_candidates_diversity <= torch.arange(0, self.args.num_generations, device=device) < (ani + 1) * self.args.num_candidates_diversity
+            for ani, adapter_name in enumerate(self.guidance_adapter_names):
+                # guidance_completion_index[adapter_name] = self.args.num_candidates_main + ani * self.args.num_candidates_per_guidance <= torch.arange(0, self.args.num_generations, device=device) < (ani + 1) * self.args.num_candidates_diversity
+                idxs = torch.arange(0, self.args.num_generations, device=device)
+                lower = self.args.num_candidates_main + ani * self.args.num_candidates_per_guidance
+                upper = (ani + 1) * self.num_candidates_per_guidance
+
+                guidance_completion_index[adapter_name] = (idxs >= lower) & (idxs < upper)
 
             prompt_completion_ids = torch.cat(prompt_completion_ids_all, dim=0)
-            breakpoint()
+            # breakpoint()
+            """
+            (Pdb) print(prompt_completion_ids.shape)
+            torch.Size([10, 1182])
+                -> Means that we have 10 prompts in the batch, and each prompt has 1182 tokens (prompt + completion)
+            """
 
             # Compute prompt length and extract completion ids
             prompt_length = prompt_ids.size(1)
             prompt_ids = prompt_completion_ids[:, :prompt_length]
             completion_ids = prompt_completion_ids[:, prompt_length:]
+            """
+            (Pdb) prompt_completion_ids[0]
+            tensor([151646,     32,  10435,  ...,    382,  12209,     11], device='cuda:0')
+            (Pdb) prompt_completion_ids[0, :prompt_length]
+            tensor([151646,     32,  10435,   1948,   2657,    323,  21388,     13,    576,
+                    1196,  17064,    264,   3405,     11,    323,    279,  21388,  67477,
+                    432,     13,    576,  17847,   1156,  15482,    911,    279,  32711,
+                    1882,    304,    279,   3971,    323,   1221,   5707,    279,   1196,
+                    448,    279,   4226,     11,    323,   2182,    697,   1590,   4226,
+                    2878,   1124,  79075,   2979,   3417,    659,    576,  32711,   1882,
+                    323,   4226,    525,  43810,   2878,    220, 151648,    220, 151649,
+                    323,    366,   9217,     29,    690,   9217,     29,   9492,     11,
+                    15576,     11,    600,   1734,   2572,    220, 151648,  32711,   1882,
+                    1588,    220, 151649,    366,   9217,     29,   4226,   1588,    690,
+                    9217,  14276,   7036,    429,   5889,    553,   6364,     11,   4183,
+                    990,   1008,  15459,     13, 151644,     32,  23725,    315,   6785,
+                    25780,    220,   4930,     64,   8402,  10109,  15087,    220,    374,
+                    353,     65,  14042,   1103,      9,    421,    256,  26107,    264,
+                        91,   8904,     10,     16,  26107,    262,  26107,    293,     91,
+                    580,     10,     16,  26107,    262,  26107,    272,     91,    370,
+                        10,     16,  26107,    220,  29901,    678,    279,  96646,   1103,
+                    88561,     13, 151645, 151648,    198], device='cuda:0')
+            (Pdb) prompt_completion_ids[0, prompt_length:]
+            tensor([71486,    11,   773,  ...,   382, 12209,    11], device='cuda:0')
+            (Pdb) prompt_length
+            158
+            (Pdb) completion_ids.shape
+            torch.Size([10, 1024])
+            (Pdb) completion_ids[0]
+            tensor([71486,    11,   773,  ...,   382, 12209,    11], device='cuda:0')
+            """
 
-        # Mask everything after the first EOS token
+        # Mask everything after the first EOS token(Given Code is from trl)
         is_eos = completion_ids == self.processing_class.eos_token_id
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
         sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
         completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+        """
+        (Pdb) is_eos.shape
+        torch.Size([10, 1024])
+        (Pdb) is_eos[0]
+        tensor([False, False, False,  ..., False, False, False], device='cuda:0')
+        (Pdb) eos_idx
+        tensor([1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024],
+            device='cuda:0')
+        (Pdb) completion_mask.shape
+        torch.Size([10, 1024])
+        (Pdb) completion_mask[0]
+        tensor([1, 1, 1,  ..., 1, 1, 1], device='cuda:0', dtype=torch.int32)
+        """
 
         # Concatenate prompt_mask with completion_mask for logit computation
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B*G, P+C)
-
+        """
+        (Pdb) prompt_mask.shape
+        torch.Size([10, 158])
+        """
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
+        """
+        (Pdb) logits_to_keep
+        1024
+        """
 
         with torch.no_grad():
             # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's
             # computation here, and use per_token_logps.detach() instead.
-            if self.num_iterations > 1:
+            if self.num_iterations > 1: 
                 old_per_token_logps = self._get_per_token_logps(
                     self.model, prompt_completion_ids, attention_mask, logits_to_keep
                 )
@@ -720,6 +840,16 @@ class CustomGuidanceGRPOTrainer(Trainer):
                         self.model, prompt_completion_ids, attention_mask, logits_to_keep
                     )
 
+            """
+            (Pdb) old_per_token_logps.shape if old_per_token_logps is not None else None
+            (Pdb) ref_per_token_logps.shape if ref_per_token_logps is not None else None
+            torch.Size([10, 1024])
+            (Pdb) old_per_token_logps[0]
+            *** TypeError: 'NoneType' object is not subscriptable
+
+            -> Natural result since num_iterations == 1!!!
+            """
+
         # Decode the generated completions
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
         if is_conversational(inputs[0]):
@@ -730,50 +860,187 @@ class CustomGuidanceGRPOTrainer(Trainer):
         else:
             completions = completions_text
 
+            """
+            (Pdb) completions[:3]
+            [[{'role': 'assistant', 
+            'content': "Alright, so I've got this problem about Brazilian triples.... | 1*3 + 1 = 4."}]]
+            (Pdb) len(completions)
+            10
+            """
+
+        # breakpoint()
+
         # ==== Computing Rewards and Advantages ====
-        rewards_per_func = torch.zeros(len(prompts) * (1 + self.num_adapters), len(self.reward_funcs), device=device)
-        all_advantages = [[] for _ in range(1 + self.num_adapters)]  # main + diversity adapters
+        num_adapters = 1 + self.num_guidance_adapters  # main + diversity adapters
+        rewards_per_func = torch.zeros(len(completions), len(self.reward_funcs), device=device)
+        is_interactive = [("interactive" in rf.__class__.__name__.lower()) for rf in self.reward_funcs]
 
-        for completion_index_mask in [main_completion_index] + [guidance_completion_index[adapter_name] for adapter_name in self.diversity_adapters]:
-            
-            masked_prompts = [p for p, mask in zip(prompts, completion_index_mask) if mask]
-            masked_completions = [c for c, mask in zip(completions, completion_index_mask) if mask]
+        prompts_expanded = prompts 
 
-            # Split by index
-            for i, (reward_func, reward_processing_class) in enumerate(zip(self.reward_funcs, self.reward_processing_classes)):
-                if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
-                    if is_conversational(inputs[0]):
-                        messages = [{"messages": p + c} for p, c in zip(masked_prompts, masked_completions)]
-                        texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
-                    else:
-                        texts = [p + c for p, c in zip(masked_prompts, masked_completions)]
-                    reward_inputs = reward_processing_class(
-                        texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
-                    )
-                    reward_inputs = super()._prepare_inputs(reward_inputs)
-                    with torch.inference_mode():
-                        rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,) ## From here ##
+        # # List that Each adapter's completion index main: 6, guidance1: 2, guidance2: 2 (total 10)
+        num_completions_per_adapter = [
+            self.num_candidates_main,
+            * [self.num_candidates_per_guidance]  # for each guidance adapter
+        ]
+        # assert len(prompts) == len(completions)
+
+        for i, (reward_func, reward_processing_class) in enumerate(zip(self.reward_funcs, self.reward_processing_classes)):
+            if not is_interactive[i]:
+                continue
+
+            if isinstance(reward_func, nn.Module):
+                if is_conversational(inputs[0]):
+                    messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
+                    texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
                 else:
-                    # Repeat all input columns (but "prompt" and "completion") to match the number of generations
-                    keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
-                    reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
-                    output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
-                    rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+                    texts = [p + c for p, c in zip(prompts, completions)]
 
-            # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
-            # completions may be distributed across processes
-            # print("rewards_per_func",rewards_per_func.shape)
-            rewards_per_func = gather(rewards_per_func)
+                reward_input = reward_processing_class(
+                    texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
+                )
+                reward_input = super()._prepare_inputs(reward_input)
+                with torch.inference_mode():
+                    reward_values = reward_func(**reward_input).logits[:, 0]  # (M,)
+                assert reward_values.shape[0] == len(completions), f"[interactive] returned {reward_values.shape[0]} but expected {len(completions)}."
+                rewards_per_func[:, i] = reward_values
+            else:
+                keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
+                reward_kwargs = {key: [ex[key] for ex in inputs] for key in keys}
+                output = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
+                output = torch.tensor(output, dtype=torch.float32, device=device)
+                assert out.shape[0] == len(completions), f"[interactive] returned {out.shape[0]} but expected {len(completions)}."
+                rewards_per_func[:, i] = output
 
-            # Apply weights to each reward function's output and sum
-            rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
+        start_idx = 0
+        debug_masks = {}
+        for adapter_idx, num_completions in enumerate(num_completions_per_adapter):
+            end_idx = start_idx + num_completions
+
+            full_mask = torch.zeros(len(completions), dtype=torch.bool, device=device)
+            full_mask[start_idx:end_idx] = True
+            debug_masks[f"guidance_adapter_{adapter_idx}"] = full_mask.to('cpu').tolist()
+
+            if num_completions > 0:
+                masked_prompts = prompts[start_idx:end_idx]
+                masked_completions = completions[start_idx:end_idx]
+                assert len(masked_prompts) == len(masked_completions) == num_completions
+
+                for i, (reward_func, reward_processing_class) in enumerate(zip(self.reward_funcs, self.reward_processing_classes)):
+                    if is_interactive[i]:
+                        continue  
+
+                    if isinstance(reward_func, nn.Module):
+                        if is_conversational(inputs[0]):
+                            messages = [{"messages": p + c} for p, c in zip(masked_prompts, masked_completions)]
+                            texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
+                        else:
+                            texts = [p + c for p, c in zip(masked_prompts, masked_completions)]
+
+                        reward_input = reward_processing_class(
+                            texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
+                        )
+                        reward_input = super()._prepare_inputs(reward_input)
+                        with torch.inference_mode():
+                            reward_values = reward_func(**reward_input).logits[:, 0]  # (num_completions,)
+                        assert reward_values.shape[0] == num_completions, \
+                            f"[non-interactive] {reward_values.shape[0]} vs {num_completions}"
+                        rewards_per_func[start_idx:end_idx, i] = reward_values
+                    else:
+                        keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
+                        reward_kwargs = {key: [ex[key] for ex in inputs] for key in keys}
+                        output = reward_func(prompts=masked_prompts, completions=masked_completions, **reward_kwargs)
+                        output = torch.tensor(output, dtype=torch.float32, device=device)
+                        assert output.shape[0] == num_completions, \
+                            f"[non-interactive] {output.shape[0]} vs {num_completions}"
+                        rewards_per_func[start_idx:end_idx, i] = output
+
+            start_idx = end_idx
             
-        
-        ######### SMI reweighting
+        rewards_per_func = gather(rewards_per_func)
+        rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)  # (M,)
+                # # Compute Rewards
+                # if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
+                #     # Check if Conversational is applied
+                #     # +) "is_conversational" is for checking the original prompt format, not the processed one
+                #     if is_conversational(inputs[0]):
+                #         messages = [{"messages": p + c} for p, c in zip(masked_prompts, masked_completions)]
+                #         texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
+                #     else:
+                #         texts = [p + c for p, c in zip(masked_prompts, masked_completions)]
+                    
+                #     reward_inputs = reward_processing_class(
+                #         texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
+                #     )
+                #     reward_inputs = super()._prepare_inputs(reward_inputs)
 
-        
+                #     with torch.inference_mode():
+                #         reward_values = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
+                #         assert reward_values.shape[0] == full_mask.sum(), \
+                #             f"Reward function returned {reward_values.shape[0]} values, but expected {full_mask.sum()}."
+                #         # rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,) 
+                #         # Firstly, Fill Reward to ALL
+                #         rewards_per_func[full_mask, i] = reward_values
+                # else:
+                #     # Repeat all input columns (but "prompt" and "completion") to match the number of generations
+                #     keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
+                #     reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
 
+                #     output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
+                #     output_reward_tensor = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+                #     assert output_reward_tensor.shape[0] == full_mask.sum(), \
+                #         f"Reward function returned {output_reward_tensor.shape[0]} values, but expected {full_mask.sum()}."
+                #     rewards_per_func[full_mask, i] = output_reward_tensor
+        
+        # The right previous code (before major modification--Just in Case........)
+        # For each set of completions (main and diversity adapters), compute rewards and advantages
+        # for completion_index_mask in [main_completion_index] + [guidance_completion_index[adapter_name] for adapter_name in self.guidance_adapter_names]:
+        #     masked_prompts = [p for p, mask in zip(prompts, completion_index_mask) if mask]
+        #     masked_completions = [c for c, mask in zip(completions, completion_index_mask) if mask]
+
+        #     # Split by index
+        #     for i, (reward_func, reward_processing_class) in enumerate(zip(self.reward_funcs, self.reward_processing_classes)):
+                
+        #         if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
+        #             # Check if Conversational is applied
+        #             # +) "is_conversational" is for checking the original prompt format, not the processed one
+        #             if is_conversational(inputs[0]):
+        #                 messages = [{"messages": p + c} for p, c in zip(masked_prompts, masked_completions)]
+        #                 texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
+        #             else:
+        #                 texts = [p + c for p, c in zip(masked_prompts, masked_completions)]
+                    
+        #             reward_inputs = reward_processing_class(
+        #                 texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
+        #             )
+        #             reward_inputs = super()._prepare_inputs(reward_inputs)
+
+        #             with torch.inference_mode():
+        #                 # rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,) 
+        #                 # Fill only the relevant part of rewards_per_func (where mask is True)
+        #                 rewards_per_func[completion_index_mask, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
+        #         else:
+        #             # Repeat all input columns (but "prompt" and "completion") to match the number of generations
+        #             keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
+        #             reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
+
+        #             output_reward_func = reward_func(prompts=masked_prompts, completions=masked_completions, **reward_kwargs)
+        #             rewards_per_func[completion_index_mask, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+
+        #     # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
+        #     # completions may be distributed across processes
+        #     # print("rewards_per_func",rewards_per_func.shape)
+        #     rewards_per_func = gather(rewards_per_func)
+
+        #     # Apply weights to each reward function's output and sum
+        #     rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
             
+        # breakpoint()
+        """
+        (Pdb) print(f"masks={debug_masks}")
+        masks={'guidance_adapter_0': [True, True, True, True, True, True, False, False, False, False], 'guidance_adapter_1': [False, False, False, False, False, False, True, True, False, False]}
+        """
+
+        ######### SMI reweighting #########
         if self.SMI_reweighting:
             if isinstance(completions[0], list):  # conversational-style completions
                 completions_flat = [
@@ -802,8 +1069,6 @@ class CustomGuidanceGRPOTrainer(Trainer):
             similarity_matrix = embeddings @ embeddings.T
             similarity_sums = similarity_matrix.sum(dim=1)
             diversity_weights = 1.0 / (similarity_sums + 1e-6)
-
-
 
             diversity_weights = gather(diversity_weights) 
 
@@ -886,6 +1151,7 @@ class CustomGuidanceGRPOTrainer(Trainer):
                 "advantages": all_advantages[2], # Need to be modified
             },
         }
+
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
