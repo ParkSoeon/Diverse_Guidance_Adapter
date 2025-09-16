@@ -648,9 +648,7 @@ class CustomGuidanceGRPOTrainer(Trainer):
 
                 try:
                     generation_batch_size = self.generation_batch_size
-                    prompt_completion_ids = unwrapped_model.generate(
-                    prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
-                    )
+                    prompt_completion_ids = unwrapped_model.generate(prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config)
 
                     print(f">> Generation batch size: {generation_batch_size} <<")
                     print(f">> Total number of candidates to be generated per data: {self.num_generations} <<")
