@@ -737,6 +737,7 @@ class CustomGuidanceGRPOTrainer(Trainer):
             prompt_length = prompt_ids.size(1)
             prompt_ids = prompt_completion_ids[:, :prompt_length]
             completion_ids = prompt_completion_ids[:, prompt_length:]
+            # breakpoint()
             """
             (Pdb) prompt_completion_ids[0]
             tensor([151646,     32,  10435,  ...,    382,  12209,     11], device='cuda:0')
@@ -775,6 +776,7 @@ class CustomGuidanceGRPOTrainer(Trainer):
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
         sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
         completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+        # breakpoint()
         """
         (Pdb) is_eos.shape
         torch.Size([10, 1024])
@@ -787,6 +789,8 @@ class CustomGuidanceGRPOTrainer(Trainer):
         torch.Size([10, 1024])
         (Pdb) completion_mask[0]
         tensor([1, 1, 1,  ..., 1, 1, 1], device='cuda:0', dtype=torch.int32)
+        (Pdb) completion_ids.dtype
+        torch.int64
         """
 
         # Concatenate prompt_mask with completion_mask for logit computation
@@ -801,27 +805,27 @@ class CustomGuidanceGRPOTrainer(Trainer):
         1024
         """
 
-        with torch.no_grad():
-            # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's
-            # computation here, and use per_token_logps.detach() instead.
-            if self.num_iterations > 1: 
-                old_per_token_logps = self._get_per_token_logps(
-                    self.model, prompt_completion_ids, attention_mask, logits_to_keep
-                )
-            else:
-                old_per_token_logps = None
+        # with torch.no_grad():
+        #     # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's
+        #     # computation here, and use per_token_logps.detach() instead.
+        #     if self.num_iterations > 1: # FLAG -> 아.....
+        #         old_per_token_logps = self._get_per_token_logps(
+        #             self.model, prompt_completion_ids, attention_mask, logits_to_keep
+        #         )
+        #     else:
+        #         old_per_token_logps = None
 
-            if self.beta == 0.0:
-                ref_per_token_logps = None
-            elif self.ref_model is not None:
-                ref_per_token_logps = self._get_per_token_logps(
-                    self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
-                )
-            else:
-                with self.accelerator.unwrap_model(self.model).disable_adapter():
-                    ref_per_token_logps = self._get_per_token_logps(
-                        self.model, prompt_completion_ids, attention_mask, logits_to_keep
-                    )
+        #     if self.beta == 0.0:
+        #         ref_per_token_logps = None
+        #     elif self.ref_model is not None:
+        #         ref_per_token_logps = self._get_per_token_logps(
+        #             self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
+        #         )
+        #     else:
+        #         with self.accelerator.unwrap_model(self.model).disable_adapter():
+        #             ref_per_token_logps = self._get_per_token_logps(
+        #                 self.model, prompt_completion_ids, attention_mask, logits_to_keep
+                    # )
 
         with torch.inference_mode():
             if self.ref_model is not None:
@@ -835,13 +839,8 @@ class CustomGuidanceGRPOTrainer(Trainer):
                     )
 
             """
-            (Pdb) old_per_token_logps.shape if old_per_token_logps is not None else None
             (Pdb) ref_per_token_logps.shape if ref_per_token_logps is not None else None
             torch.Size([10, 1024])
-            (Pdb) old_per_token_logps[0]
-            *** TypeError: 'NoneType' object is not subscriptable
-
-            -> Natural result since num_iterations == 1!!!
             """
 
         # Decode the generated completions
@@ -853,13 +852,16 @@ class CustomGuidanceGRPOTrainer(Trainer):
                 completions.append([{"role": "assistant", "content": bootstrap + completion}])
         else:
             completions = completions_text
-
             """
             (Pdb) completions[:3]
             [[{'role': 'assistant', 
             'content': "Alright, so I've got this problem about Brazilian triples.... | 1*3 + 1 = 4."}]]
             (Pdb) len(completions)
             10
+            (Pdb) completion_ids.dtype
+            torch.int64
+            (Pdb) completion_ids.shape
+            torch.Size([10, 1024])
             """
 
         # breakpoint()
@@ -867,54 +869,65 @@ class CustomGuidanceGRPOTrainer(Trainer):
         # ==== Computing Rewards and Advantages ====
         num_adapters = 1 + self.num_guidance_adapters  # main + diversity adapters
         rewards_per_func = torch.zeros(len(completions), len(self.reward_funcs), device=device)
-        is_interactive = [("interactive" in rf.__class__.__name__.lower()) for rf in self.reward_funcs]
+        is_interactive = [("interactive" in rf.__class__.__name__.lower()) for rf in self.reward_funcs] # If the word "interactive" is in the reward function name
 
-        prompts_expanded = prompts 
-
-        # # List that Each adapter's completion index main: 6, guidance1: 2, guidance2: 2 (total 10)
+        # List that Each adapter's completion index main: 6, guidance1: 2, guidance2: 2 (total 10)
         num_completions_per_adapter = [
             self.num_candidates_main,
-            * [self.num_candidates_per_guidance]  # for each guidance adapter
+            * [self.num_candidates_per_guidance] * len(self.guidance_adapter_names) # for each guidance adapter
         ]
         # assert len(prompts) == len(completions)
 
-        for i, (reward_func, reward_processing_class) in enumerate(zip(self.reward_funcs, self.reward_processing_classes)):
-            if not is_interactive[i]:
-                continue
-
-            if isinstance(reward_func, nn.Module):
-                if is_conversational(inputs[0]):
-                    messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
-                    texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
-                else:
-                    texts = [p + c for p, c in zip(prompts, completions)]
-
-                reward_input = reward_processing_class(
-                    texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
-                )
-                reward_input = super()._prepare_inputs(reward_input)
-                with torch.inference_mode():
-                    reward_values = reward_func(**reward_input).logits[:, 0]  # (M,)
-                assert reward_values.shape[0] == len(completions), f"[interactive] returned {reward_values.shape[0]} but expected {len(completions)}."
-                rewards_per_func[:, i] = reward_values
-            else:
-                keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
-                reward_kwargs = {key: [ex[key] for ex in inputs] for key in keys}
-                output = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
-                output = torch.tensor(output, dtype=torch.float32, device=device)
-                assert out.shape[0] == len(completions), f"[interactive] returned {out.shape[0]} but expected {len(completions)}."
-                rewards_per_func[:, i] = output
-
         start_idx = 0
+        all_advantages = []
+        final_prompt_ids_list = []
+        completion_ids_list = []
+
+        for adapter_idx, num_completions in enumerate(num_completions_per_adapter): # for each adapter
+            end_idx = start_idx + num_completions
+
+            if num_completions > 0:
+                masked_prompts = prompts[start_idx:end_idx]
+                masked_completions = completions[start_idx:end_idx]
+                assert len(masked_prompts) == len(masked_completions) == num_completions
+
+                # Interactive Rewards first
+                for i, (reward_func, reward_processing_class) in enumerate(zip(self.reward_funcs, self.reward_processing_classes)):
+                    if not is_interactive[i]: # non-interactive reward functions will just compare completions within the same group from each adapter
+                        continue
+
+                    if isinstance(reward_func, nn.Module): 
+                        if is_conversational(inputs[0]): # conversational-style completions
+                            messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
+                            texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
+                        else:
+                            texts = [p + c for p, c in zip(prompts, completions)]
+
+                        reward_input = reward_processing_class( # entire text = prompt + completion
+                            texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
+                        )
+                        reward_input = super()._prepare_inputs(reward_input)
+                        with torch.inference_mode():
+                            reward_values = reward_func(**reward_input).logits[:, 0]  # (M,)
+                        assert reward_values.shape[0] == len(completions), f"[interactive] returned {reward_values.shape[0]} but expected {len(completions)}."
+                        rewards_per_func[:, i] = reward_values
+                    else:
+                        keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
+                        reward_kwargs = {key: [ex[key] for ex in inputs] for key in keys}
+                        output = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
+                        output = torch.tensor(output, dtype=torch.float32, device=device)
+                        assert out.shape[0] == len(completions), f"[interactive] returned {out.shape[0]} but expected {len(completions)}."
+                        rewards_per_func[:, i] = output
+
         debug_masks = {}
-        for adapter_idx, num_completions in enumerate(num_completions_per_adapter):
+        for adapter_idx, num_completions in enumerate(num_completions_per_adapter): # for each adapter
             end_idx = start_idx + num_completions
 
             full_mask = torch.zeros(len(completions), dtype=torch.bool, device=device)
             full_mask[start_idx:end_idx] = True
-            debug_masks[f"guidance_adapter_{adapter_idx}"] = full_mask.to('cpu').tolist()
+            debug_masks[f"adapter_{adapter_idx}"] = full_mask.to('cpu').tolist() # Just for Debugging
 
-            if num_completions > 0:
+            if num_completions > 0: # if this adapter has completions
                 masked_prompts = prompts[start_idx:end_idx]
                 masked_completions = completions[start_idx:end_idx]
                 assert len(masked_prompts) == len(masked_completions) == num_completions
@@ -939,6 +952,7 @@ class CustomGuidanceGRPOTrainer(Trainer):
                         assert reward_values.shape[0] == num_completions, \
                             f"[non-interactive] {reward_values.shape[0]} vs {num_completions}"
                         rewards_per_func[start_idx:end_idx, i] = reward_values
+                        # rewards_per_func[:, i] = reward_values
                     else:
                         keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
                         reward_kwargs = {key: [ex[key] for ex in inputs] for key in keys}
@@ -947,91 +961,26 @@ class CustomGuidanceGRPOTrainer(Trainer):
                         assert output.shape[0] == num_completions, \
                             f"[non-interactive] {output.shape[0]} vs {num_completions}"
                         rewards_per_func[start_idx:end_idx, i] = output
+                        # rewards_per_func[:, i] = output
+
+                grouped_rewards = rewards_per_func[start_idx:end_idx].mean(1)
+                advantages = rewards_per_func[start_idx:end_idx].sum(1) - grouped_rewards
+                all_advantages.append(advantages)
+
+                final_prompt_ids_list.append(masked_prompts)
+                completion_ids_list.append(masked_completions)
 
             start_idx = end_idx
             
         rewards_per_func = gather(rewards_per_func)
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)  # (M,)
-                # # Compute Rewards
-                # if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
-                #     # Check if Conversational is applied
-                #     # +) "is_conversational" is for checking the original prompt format, not the processed one
-                #     if is_conversational(inputs[0]):
-                #         messages = [{"messages": p + c} for p, c in zip(masked_prompts, masked_completions)]
-                #         texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
-                #     else:
-                #         texts = [p + c for p, c in zip(masked_prompts, masked_completions)]
-                    
-                #     reward_inputs = reward_processing_class(
-                #         texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
-                #     )
-                #     reward_inputs = super()._prepare_inputs(reward_inputs)
-
-                #     with torch.inference_mode():
-                #         reward_values = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
-                #         assert reward_values.shape[0] == full_mask.sum(), \
-                #             f"Reward function returned {reward_values.shape[0]} values, but expected {full_mask.sum()}."
-                #         # rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,) 
-                #         # Firstly, Fill Reward to ALL
-                #         rewards_per_func[full_mask, i] = reward_values
-                # else:
-                #     # Repeat all input columns (but "prompt" and "completion") to match the number of generations
-                #     keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
-                #     reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
-
-                #     output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
-                #     output_reward_tensor = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
-                #     assert output_reward_tensor.shape[0] == full_mask.sum(), \
-                #         f"Reward function returned {output_reward_tensor.shape[0]} values, but expected {full_mask.sum()}."
-                #     rewards_per_func[full_mask, i] = output_reward_tensor
-        
-        # The right previous code (before major modification--Just in Case........)
-        # For each set of completions (main and diversity adapters), compute rewards and advantages
-        # for completion_index_mask in [main_completion_index] + [guidance_completion_index[adapter_name] for adapter_name in self.guidance_adapter_names]:
-        #     masked_prompts = [p for p, mask in zip(prompts, completion_index_mask) if mask]
-        #     masked_completions = [c for c, mask in zip(completions, completion_index_mask) if mask]
-
-        #     # Split by index
-        #     for i, (reward_func, reward_processing_class) in enumerate(zip(self.reward_funcs, self.reward_processing_classes)):
-                
-        #         if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
-        #             # Check if Conversational is applied
-        #             # +) "is_conversational" is for checking the original prompt format, not the processed one
-        #             if is_conversational(inputs[0]):
-        #                 messages = [{"messages": p + c} for p, c in zip(masked_prompts, masked_completions)]
-        #                 texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
-        #             else:
-        #                 texts = [p + c for p, c in zip(masked_prompts, masked_completions)]
-                    
-        #             reward_inputs = reward_processing_class(
-        #                 texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
-        #             )
-        #             reward_inputs = super()._prepare_inputs(reward_inputs)
-
-        #             with torch.inference_mode():
-        #                 # rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,) 
-        #                 # Fill only the relevant part of rewards_per_func (where mask is True)
-        #                 rewards_per_func[completion_index_mask, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
-        #         else:
-        #             # Repeat all input columns (but "prompt" and "completion") to match the number of generations
-        #             keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
-        #             reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
-
-        #             output_reward_func = reward_func(prompts=masked_prompts, completions=masked_completions, **reward_kwargs)
-        #             rewards_per_func[completion_index_mask, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
-
-        #     # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
-        #     # completions may be distributed across processes
-        #     # print("rewards_per_func",rewards_per_func.shape)
-        #     rewards_per_func = gather(rewards_per_func)
-
-        #     # Apply weights to each reward function's output and sum
-        #     rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
             
-        breakpoint()
+        # breakpoint()
         """
         (Pdb) print(f"masks={debug_masks}")
-        masks={'guidance_adapter_0': [True, True, True, True, True, True, False, False, False, False], 'guidance_adapter_1': [False, False, False, False, False, False, True, True, False, False]}
+        masks={'guidance_adapter_0': [True, True, True, True, True, True, False, False, False, False], 'guidance_adapter_1': [False, False, False, False, False, False, True, True, False, False], 'guidance_adapter_2': [False, False, False, False, False, False, False, False, True, True]}
+        (Pdb) print(f"number of masks={len(debug_masks)}")
+        number of masks=3
         """
 
         ######### SMI reweighting #########
@@ -1067,7 +1016,9 @@ class CustomGuidanceGRPOTrainer(Trainer):
             diversity_weights = gather(diversity_weights) 
 
             rewards = rewards * diversity_weights
-        
+
+        ########
+
         
         # Compute grouped-wise rewards
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
@@ -1077,13 +1028,6 @@ class CustomGuidanceGRPOTrainer(Trainer):
         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         advantages = (rewards - mean_grouped_rewards) #/ (std_grouped_rewards + 1e-4)
-
-        # Slice to keep only the local part of the data
-        process_slice = slice(
-            self.accelerator.process_index * len(prompts),
-            (self.accelerator.process_index + 1) * len(prompts),
-        )
-        advantages = advantages[process_slice]
 
         # Log the metrics
         reward_per_func = rewards_per_func.mean(0)
@@ -1116,35 +1060,119 @@ class CustomGuidanceGRPOTrainer(Trainer):
             if wandb.run is not None and self.accelerator.is_main_process:
                 wandb.log({"completions": wandb.Table(dataframe=df)})
 
+        prompt_mask_list = []
+        completion_mask_list = []
+        ref_per_token_logps_list = []
+
+        """
+        (Pdb) completion_ids.shape
+        torch.Size([10, 1024])
+        (Pdb) completion_ids.dtype
+        torch.int64
+        """
+        # breakpoint()
+        for batch_idx in range(num_batches):  
+            # Bring completion_ids and prompt_ids in current batch
+            current_completion_ids = completion_ids_list[batch_idx] # [B, Lc]
+            current_prompt_ids = final_prompt_ids_list[batch_idx] # [B, Lp]
+            current_ref_logps = ref_per_token_logps_list_input[i]  # [B, total_seq_len]
+            
+            B = current_completion_ids.size(0)
+            Lp = current_prompt_ids.size(1)
+            Lc = current_completion_ids.size(1)
+            
+            # Append to the lists
+            prompt_mask_list.append(torch.ones((B, Lp), dtype=torch.bool, device=current_prompt_ids.device))
+            completion_mask_list.append(torch.ones((B, Lc), dtype=torch.bool, device=current_completion_ids.device))
+            
+            completion_start = Lp
+            completion_end = Lp + Lc
+            ref_per_token_logps_list.append(current_ref_logps[:, completion_start:completion_end])
+        """
+        (Pdb) completion_ids.dtype
+        torch.int64
+        (Pdb) completion_ids.shape
+        torch.Size([10, 1024])
+        """
+
+        breakpoint()
+        """
+        All are lists
+        (Pdb) len(final_prompt_ids_list)
+        3
+        (Pdb) len(prompt_mask_list)
+        1
+        (Pdb) len(completion_ids_list)
+        3
+        (Pdb) len(completion_mask_list)
+        1
+        (Pdb) len(ref_per_token_logps_list)
+        1
+        (Pdb) len(all_advantages)
+        3
+        """
+
         return {
-            "main": { # 
-                "prompt_ids": final_prompt_ids,
-                "prompt_mask": expanded_prompt_mask, 
-                "completion_ids": completion_ids,
-                "completion_mask": completion_mask,
-                "old_per_token_logps": all_old_per_token_logps,
-                "ref_per_token_logps": all_ref_per_token_logps,
-                "advantages": all_advantages[0], # Need to be modified
+            "main": {
+                "prompt_ids": final_prompt_ids_list[0],
+                "prompt_mask": prompt_mask_list[0],
+                "completion_ids": completion_ids_list[0],
+                "completion_mask": completion_mask_list[0],
+                # "old_per_token_logps": old_per_token_logps_list[0],
+                "ref_per_token_logps": ref_per_token_logps_list[0],
+                "advantages": all_advantages[0],
             },
-            "guidance_1": {
-                "prompt_ids": final_prompt_ids,
-                "prompt_mask": expanded_prompt_mask, 
-                "completion_ids": completion_ids,
-                "completion_mask": completion_mask,
-                "old_per_token_logps": all_old_per_token_logps,
-                "ref_per_token_logps": all_ref_per_token_logps,
-                "advantages": all_advantages[1], # Need to be modified
+            "guidance_adapter_0": {
+                "prompt_ids": final_prompt_ids_list[1],
+                "prompt_mask": prompt_mask_list[1],
+                "completion_ids": completion_ids_list[1],
+                "completion_mask": completion_mask_list[1], 
+                # "old_per_token_logps": old_per_token_logps_list[1],
+                "ref_per_token_logps": ref_per_token_logps_list[1],
+                "advantages": all_advantages[1],
             },
-            "guidance_2": {
-                "prompt_ids": final_prompt_ids,
-                "prompt_mask": expanded_prompt_mask, 
-                "completion_ids": completion_ids,
-                "completion_mask": completion_mask,
-                "old_per_token_logps": all_old_per_token_logps,
-                "ref_per_token_logps": all_ref_per_token_logps,
-                "advantages": all_advantages[2], # Need to be modified
+            "guidance_adapter_1": {
+                "prompt_ids": final_prompt_ids_list[2],
+                "prompt_mask": prompt_mask_list[2],
+                "completion_ids": completion_ids_list[2],
+                "completion_mask": completion_mask_list[2], 
+                # "old_per_token_logps": old_per_token_logps_list[2],
+                "ref_per_token_logps": ref_per_token_logps_list[2],
+                "advantages": all_advantages[2],
             },
         }
+
+        breakpoint()
+
+        # return {
+        #     "main": { # 
+        #         "prompt_ids": final_prompt_ids,
+        #         "prompt_mask": expanded_prompt_mask, 
+        #         "completion_ids": completion_ids,
+        #         "completion_mask": completion_mask,
+        #         "old_per_token_logps": all_old_per_token_logps,
+        #         "ref_per_token_logps": all_ref_per_token_logps,
+        #         "advantages": all_advantages[0], # Need to be modified
+        #     },
+        #     "guidance_1": {
+        #         "prompt_ids": final_prompt_ids,
+        #         "prompt_mask": expanded_prompt_mask, 
+        #         "completion_ids": completion_ids,
+        #         "completion_mask": completion_mask,
+        #         "old_per_token_logps": all_old_per_token_logps,
+        #         "ref_per_token_logps": all_ref_per_token_logps,
+        #         "advantages": all_advantages[1], # Need to be modified
+        #     },
+        #     "guidance_2": {
+        #         "prompt_ids": final_prompt_ids,
+        #         "prompt_mask": expanded_prompt_mask, 
+        #         "completion_ids": completion_ids,
+        #         "completion_mask": completion_mask,
+        #         "old_per_token_logps": all_old_per_token_logps,
+        #         "ref_per_token_logps": all_ref_per_token_logps,
+        #         "advantages": all_advantages[2], # Need to be modified
+        #     },
+        # }
 
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
