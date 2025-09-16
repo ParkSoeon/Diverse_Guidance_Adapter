@@ -16,6 +16,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass, field
+import wandb
 
 import datasets
 import torch
@@ -25,7 +26,7 @@ from transformers import set_seed, AutoModelForCausalLM, AutoTokenizer, BitsAndB
 from transformers.trainer_utils import get_last_checkpoint
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
-from src.open_r1.configs import GRPOConfig
+from src.open_r1.custom_drgrpo_config import GRPOConfig
 from src.open_r1.rewards import (
     accuracy_reward,
     code_reward,
@@ -46,9 +47,9 @@ from src.open_r1.trl import DRGRPOTrainer,GRPOTrainer, ModelConfig, ScriptArgume
 from sentence_transformers import SentenceTransformer
 import torch.nn.functional as F
 
+from src.open_r1.custom_drgrpo_trainer import CustomGuidanceGRPOTrainer
 
 logger = logging.getLogger(__name__)
-
 
 @dataclass
 class GRPOScriptArguments(ScriptArguments):
@@ -114,10 +115,21 @@ class GRPOScriptArguments(ScriptArguments):
         },
     )
 
+def set_run_name(training_args, script_args, model_args):
+    if training_args.run_name is None:
+        base_name = model_args.model_name_or_path.split("/")[-1]
+        training_args.run_name = (
+            f"{base_name}-lr{training_args.learning_rate}"
+            f"-mcl{training_args.max_completion_length}"
+            f"-epoch{training_args.num_train_epochs}"
+        )
+    return training_args.run_name
 
 def main(script_args, training_args, model_args):
     # Set seed for reproducibility
     set_seed(training_args.seed)
+
+    wandb.init(project="acl2026", name=training_args.run_name)
 
     ###############
     # Setup logging
@@ -149,6 +161,9 @@ def main(script_args, training_args, model_args):
         last_checkpoint = get_last_checkpoint(training_args.output_dir)
     if last_checkpoint is not None and training_args.resume_from_checkpoint is None:
         logger.info(f"Checkpoint detected, resuming training at {last_checkpoint=}.")
+
+    training_args.run_name = set_run_name(training_args, script_args, model_args)
+    logger.info(f"Run name: {training_args.run_name}")
 
     if "wandb" in training_args.report_to:
         init_wandb_training(training_args)
@@ -234,6 +249,8 @@ def main(script_args, training_args, model_args):
     tokenizer.pad_token = tokenizer.eos_token
     model.config.use_cache = False
 
+    model = prepare_model_for_kbit_training(model)
+
     # Configure LoRA for parameter-efficient fine-tuning
     peft_config = LoraConfig(
         r=model_args.lora_r,
@@ -244,8 +261,13 @@ def main(script_args, training_args, model_args):
     )
 
     model = get_peft_model(model, peft_config)
-    model = prepare_model_for_kbit_training(model)
     model.print_trainable_parameters()
+
+    # Create Adapter for Guidance Adapters
+    for i in range(int(training_args.num_guidance_adapters)):
+        adapter_name = f"diversity_guidance_adapter_{i}"
+        model.add_adapter(adapter_name, peft_config)
+        logger.info(f">> Added adapter: {adapter_name}")
 
     #############################
     # Initialize the DRGRPO trainer
@@ -253,7 +275,7 @@ def main(script_args, training_args, model_args):
     print('*'*10)
     print('runing DRGRPOTrainer')
     print('*'*10)
-    trainer = DRGRPOTrainer(
+    trainer = CustomGuidanceGRPOTrainer(
         model=model,
         reward_funcs=reward_funcs,
         args=training_args,
@@ -263,6 +285,8 @@ def main(script_args, training_args, model_args):
         callbacks=get_callbacks(training_args, model_args),
         processing_class=tokenizer,
     )
+    trainer.config.use_cache = False
+    trainer.gradient_checkpointing_enable()
 
     ###############
     # Training loop
@@ -273,7 +297,7 @@ def main(script_args, training_args, model_args):
         checkpoint = training_args.resume_from_checkpoint
     elif last_checkpoint is not None:
         checkpoint = last_checkpoint
-    train_result = trainer.train(resume_from_checkpoint=None)
+    train_result = trainer.train() #(resume_from_checkpoint=None)
     metrics = train_result.metrics
     metrics["train_samples"] = len(dataset[script_args.dataset_train_split])
     trainer.log_metrics("train", metrics)
