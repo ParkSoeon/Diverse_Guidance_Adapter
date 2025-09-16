@@ -285,8 +285,8 @@ def main(script_args, training_args, model_args):
         callbacks=get_callbacks(training_args, model_args),
         processing_class=tokenizer,
     )
-    trainer.config.use_cache = False
-    trainer.gradient_checkpointing_enable()
+    trainer.model.config.use_cache = False
+    trainer.model.gradient_checkpointing_enable()
 
     ###############
     # Training loop
