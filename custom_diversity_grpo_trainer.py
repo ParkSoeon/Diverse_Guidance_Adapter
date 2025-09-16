@@ -28,8 +28,7 @@ from accelerate.utils.other import is_compiled_module
 from datasets import Dataset, IterableDataset
 from packaging import version
 from torch import nn
-from torch.utils.data import Sampler, Dataset
-
+from torch.utils.data import Sampler
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForSequenceClassification,
@@ -499,17 +498,12 @@ class CustomGuidanceGRPOTrainer(Trainer):
         if self._signature_columns is None:
             self._signature_columns = ["prompt"]
 
-    def _get_train_sampler(self, train_dataset: Optional[Dataset] = None) -> Optional[Sampler]:
+    def _get_train_sampler(self) -> Sampler:
         # Returns a sampler that ensures each prompt is repeated across multiple processes. This guarantees that
         # identical prompts are distributed to different GPUs, allowing rewards to be computed and normalized correctly
         # within each prompt group. Using the same seed across processes ensures consistent prompt assignment,
         # preventing discrepancies in group formation.
-
-        if train_dataset is None:
-            train_dataset = self.train_dataset
-        if train_dataset is None:
-            return None
-        return RepeatRandomSampler(train_dataset, self.num_generations, seed=self.args.seed)
+        return RepeatRandomSampler(self.train_dataset, self.num_generations, seed=self.args.seed)
 
     def _get_eval_sampler(self, eval_dataset) -> Sampler:
         # Returns a sampler that ensures each prompt is repeated across multiple processes. This guarantees that
@@ -641,78 +635,72 @@ class CustomGuidanceGRPOTrainer(Trainer):
             # Regular generation path
             all_generations = {"main": [], "guidance": {}}
             with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
-                # generation_batch_size = self.generation_batch_size
-                # prompt_completion_ids = unwrapped_model.generate(
-                original_use_cache = unwrapped_model.config.use_cache
-                unwrapped_model.config.use_cache = True
+                generation_batch_size = self.generation_batch_size
+                prompt_completion_ids = unwrapped_model.generate(
+                    prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
+                )
 
-                try:
-                    generation_batch_size = self.generation_batch_size
-                    prompt_completion_ids = unwrapped_model.generate(prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config)
+                print(f">> Generation batch size: {generation_batch_size} <<")
+                print(f">> Total number of candidates to be generated per data: {self.num_generations} <<")
+                print(f">> Number of prompts in the current batch: {prompt_ids.size(0)} <<")
 
-                    print(f">> Generation batch size: {generation_batch_size} <<")
-                    print(f">> Total number of candidates to be generated per data: {self.num_generations} <<")
-                    print(f">> Number of prompts in the current batch: {prompt_ids.size(0)} <<")
+                # ==== 1. Main Adapter Generations(based on Accuracy--openrs baseline) ====
+                for i in range(0, self.args.num_candidates_main, generation_batch_size):
+                    end_idx = min(i + generation_batch_size, prompt_ids.size(0))
+                    batch_prompt_ids = prompt_ids[i:end_idx].to(device)
+                    # batch_size = batch_prompt_ids.size(0)
 
-                    # ==== 1. Main Adapter Generations(based on Accuracy--openrs baseline) ====
-                    for i in range(0, self.args.num_candidates_main, generation_batch_size):
+                    try:
+                        unwrapped_model.set_adapter("default")
+                        logger.info(">> Switched to Main Adapter for generation. <<")
+                    except:
+                        logger.warning(f"[[WARNING]] Could not switch to Main Adapter. Make sure the adapter is loaded properly.")
+                        assert False
+
+                    main_outputs = unwrapped_model.generate(
+                        input_ids = batch_prompt_ids,
+                        generation_config=self.generation_config,
+                    )
+                    all_generations["main"].append(main_outputs)
+                    logger.info(f">> Generated {main_outputs.shape[0]} sequences with main adapter. <<")
+
+                # ==== 2. Diversity Guidance Generations (based on Diversity Guidance) ====
+                for adapter_name in self.guidance_adapter_names:
+                    all_generations["guidance"][adapter_name] = []
+
+                    for i in range(0, self.args.num_candidates_per_guidance, generation_batch_size):
                         end_idx = min(i + generation_batch_size, prompt_ids.size(0))
                         batch_prompt_ids = prompt_ids[i:end_idx].to(device)
                         # batch_size = batch_prompt_ids.size(0)
 
                         try:
-                            unwrapped_model.set_adapter("default")
-                            logger.info(">> Switched to Main Adapter for generation. <<")
+                            unwrapped_model.set_adapter(adapter_name)
+                            logger.info(f">> Switched to adapter {adapter_name} for generation. <<")
                         except:
-                            logger.warning(f"[[WARNING]] Could not switch to Main Adapter. Make sure the adapter is loaded properly.")
+                            logger.warning(f"[[WARNING]] Could not switch to adapter {adapter_name}. Make sure the adapter is loaded properly.")
                             assert False
 
-                        main_outputs = unwrapped_model.generate(
+                        guidance_outputs = unwrapped_model.generate(
                             input_ids = batch_prompt_ids,
                             generation_config=self.generation_config,
                         )
-                        all_generations["main"].append(main_outputs)
-                        logger.info(f">> Generated {main_outputs.shape[0]} sequences with main adapter. <<")
-
-                    # ==== 2. Diversity Guidance Generations (based on Diversity Guidance) ====
-                    for adapter_name in self.guidance_adapter_names:
+                        all_generations["guidance"][adapter_name].append(guidance_outputs)
                         all_generations["guidance"][adapter_name] = []
+                        logger.info(f">> Generated {guidance_outputs.shape[0]} sequences with adapter {adapter_name}. <<")
+                        logger.info(f">> Generated {self.args.num_candidates_per_guidance} Candidates for Each Prompt with adapter {adapter_name}. <<")
 
-                        for i in range(0, self.args.num_candidates_per_guidance, generation_batch_size):
-                            end_idx = min(i + generation_batch_size, prompt_ids.size(0))
-                            batch_prompt_ids = prompt_ids[i:end_idx].to(device)
-                            # batch_size = batch_prompt_ids.size(0)
+                    # Restore the main adapter after generation(SWITCH back to main adapter)
+                    try:
+                        unwrapped_model.set_adapter("default")
+                        logger.info(">> Restored to main adapter after guidance generations. <<")
+                    except:
+                        logger.warning(f"[[WARNING]] Could not restore to Main Adapter. Make sure the adapter is loaded properly.")
+                        assert False
 
-                            try:
-                                unwrapped_model.set_adapter(adapter_name)
-                                logger.info(f">> Switched to adapter {adapter_name} for generation. <<")
-                            except:
-                                logger.warning(f"[[WARNING]] Could not switch to adapter {adapter_name}. Make sure the adapter is loaded properly.")
-                                assert False
+                    # Free GPU cache per batch(Optional...)
+                    del batch_prompt_ids
+                    torch.cuda.empty_cache()
 
-                            guidance_outputs = unwrapped_model.generate(
-                                input_ids = batch_prompt_ids,
-                                generation_config=self.generation_config,
-                            )
-                            all_generations["guidance"][adapter_name].append(guidance_outputs)
-                            all_generations["guidance"][adapter_name] = []
-                            logger.info(f">> Generated {guidance_outputs.shape[0]} sequences with adapter {adapter_name}. <<")
-                            logger.info(f">> Generated {self.args.num_candidates_per_guidance} Candidates for Each Prompt with adapter {adapter_name}. <<")
-
-                        # Restore the main adapter after generation(SWITCH back to main adapter)
-                        try:
-                            unwrapped_model.set_adapter("default")
-                            logger.info(">> Restored to main adapter after guidance generations. <<")
-                        except:
-                            logger.warning(f"[[WARNING]] Could not restore to Main Adapter. Make sure the adapter is loaded properly.")
-                            assert False
-
-                        # Free GPU cache per batch(Optional...)
-                        del batch_prompt_ids
-                        torch.cuda.empty_cache()
-
-                finally:
-                    unwrapped_model.config.use_cache = original_use_cache
 
             prompt_completion_ids_all = []
             # prompt_completion_ids_all_main = torch.cat(all_generations["main"], dim=0)
@@ -964,7 +952,82 @@ class CustomGuidanceGRPOTrainer(Trainer):
             
         rewards_per_func = gather(rewards_per_func)
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)  # (M,)
+                # # Compute Rewards
+                # if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
+                #     # Check if Conversational is applied
+                #     # +) "is_conversational" is for checking the original prompt format, not the processed one
+                #     if is_conversational(inputs[0]):
+                #         messages = [{"messages": p + c} for p, c in zip(masked_prompts, masked_completions)]
+                #         texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
+                #     else:
+                #         texts = [p + c for p, c in zip(masked_prompts, masked_completions)]
+                    
+                #     reward_inputs = reward_processing_class(
+                #         texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
+                #     )
+                #     reward_inputs = super()._prepare_inputs(reward_inputs)
 
+                #     with torch.inference_mode():
+                #         reward_values = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
+                #         assert reward_values.shape[0] == full_mask.sum(), \
+                #             f"Reward function returned {reward_values.shape[0]} values, but expected {full_mask.sum()}."
+                #         # rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,) 
+                #         # Firstly, Fill Reward to ALL
+                #         rewards_per_func[full_mask, i] = reward_values
+                # else:
+                #     # Repeat all input columns (but "prompt" and "completion") to match the number of generations
+                #     keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
+                #     reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
+
+                #     output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
+                #     output_reward_tensor = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+                #     assert output_reward_tensor.shape[0] == full_mask.sum(), \
+                #         f"Reward function returned {output_reward_tensor.shape[0]} values, but expected {full_mask.sum()}."
+                #     rewards_per_func[full_mask, i] = output_reward_tensor
+        
+        # The right previous code (before major modification--Just in Case........)
+        # For each set of completions (main and diversity adapters), compute rewards and advantages
+        # for completion_index_mask in [main_completion_index] + [guidance_completion_index[adapter_name] for adapter_name in self.guidance_adapter_names]:
+        #     masked_prompts = [p for p, mask in zip(prompts, completion_index_mask) if mask]
+        #     masked_completions = [c for c, mask in zip(completions, completion_index_mask) if mask]
+
+        #     # Split by index
+        #     for i, (reward_func, reward_processing_class) in enumerate(zip(self.reward_funcs, self.reward_processing_classes)):
+                
+        #         if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
+        #             # Check if Conversational is applied
+        #             # +) "is_conversational" is for checking the original prompt format, not the processed one
+        #             if is_conversational(inputs[0]):
+        #                 messages = [{"messages": p + c} for p, c in zip(masked_prompts, masked_completions)]
+        #                 texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
+        #             else:
+        #                 texts = [p + c for p, c in zip(masked_prompts, masked_completions)]
+                    
+        #             reward_inputs = reward_processing_class(
+        #                 texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
+        #             )
+        #             reward_inputs = super()._prepare_inputs(reward_inputs)
+
+        #             with torch.inference_mode():
+        #                 # rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,) 
+        #                 # Fill only the relevant part of rewards_per_func (where mask is True)
+        #                 rewards_per_func[completion_index_mask, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
+        #         else:
+        #             # Repeat all input columns (but "prompt" and "completion") to match the number of generations
+        #             keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
+        #             reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
+
+        #             output_reward_func = reward_func(prompts=masked_prompts, completions=masked_completions, **reward_kwargs)
+        #             rewards_per_func[completion_index_mask, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+
+        #     # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
+        #     # completions may be distributed across processes
+        #     # print("rewards_per_func",rewards_per_func.shape)
+        #     rewards_per_func = gather(rewards_per_func)
+
+        #     # Apply weights to each reward function's output and sum
+        #     rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
+            
         breakpoint()
         """
         (Pdb) print(f"masks={debug_masks}")
