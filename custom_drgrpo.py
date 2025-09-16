@@ -249,7 +249,8 @@ def main(script_args, training_args, model_args):
     tokenizer.pad_token = tokenizer.eos_token
     model.config.use_cache = False
 
-    model = prepare_model_for_kbit_training(model)
+    # model = prepare_model_for_kbit_training(model)
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
 
     # Configure LoRA for parameter-efficient fine-tuning
     peft_config = LoraConfig(
