@@ -220,14 +220,6 @@ def main(script_args, training_args, model_args):
     torch_dtype = (
         model_args.torch_dtype if model_args.torch_dtype in ["auto", None] else getattr(torch, model_args.torch_dtype)
     )
-    # model_kwargs = dict(
-    #     revision=model_args.model_revision,
-    #     trust_remote_code=model_args.trust_remote_code,
-    #     attn_implementation=model_args.attn_implementation,
-    #     torch_dtype=torch_dtype,
-    #     use_cache=False if training_args.gradient_checkpointing else True,
-    # )
-    # training_args.model_init_kwargs = model_kwargs
 
     # 4 bit quantization configuration
     bnb_config = BitsAndBytesConfig(
@@ -266,7 +258,7 @@ def main(script_args, training_args, model_args):
 
     # Create Adapter for Guidance Adapters
     for i in range(int(training_args.num_guidance_adapters)):
-        adapter_name = f"diversity_guidance_adapter_{i}"
+        adapter_name = f"guidance_adapter_{i}"
         model.add_adapter(adapter_name, peft_config)
         logger.info(f"Added adapter: {adapter_name}")
 
