@@ -65,6 +65,27 @@ from transformers import AutoModel
 
 import torch.nn.functional as F
 
+from src.open_r1.rewards import (
+    accuracy_reward,
+    code_reward,
+    format_reward,
+    get_code_format_reward,
+    get_cosine_scaled_reward,
+    get_repetition_penalty_reward,
+    len_reward,
+    reasoning_steps_reward,
+    tag_count_reward,
+)
+
+from src.open_r1.diversity_reward_func import (
+    interactive_negative_bleu_reward_func,
+    interactive_bleu_in_denominator_reward_func,
+    interactive_one_minus_bleu_reward_func,
+    smi_reward_func,
+    interactive_bleu_difference_reward_func
+)
+
+
 logger = logging.getLogger(__name__)
 
 if is_peft_available():
@@ -216,6 +237,7 @@ class CustomGuidanceGRPOTrainer(Trainer):
         self,
         model: Union[str, PreTrainedModel],
         reward_funcs: Union[RewardFunc, list[RewardFunc]],
+        reward_funcs_registry: dict = None,
         args: GRPOConfig = None,
         train_dataset: Optional[Union[Dataset, IterableDataset]] = None,
         eval_dataset: Optional[Union[Dataset, IterableDataset, dict[str, Union[Dataset, IterableDataset]]]] = None,
@@ -297,6 +319,7 @@ class CustomGuidanceGRPOTrainer(Trainer):
                     reward_func, num_labels=1, **model_init_kwargs
                 )
         self.reward_funcs = reward_funcs
+        self.reward_funcs_registry = reward_funcs_registry or {}
 
         # Reward weights
         if args.reward_weights is not None:
@@ -364,7 +387,6 @@ class CustomGuidanceGRPOTrainer(Trainer):
         self.generation_batch_size = args.generation_batch_size
         self.num_iterations = args.num_iterations
         self.num_guidance_adapters = args.num_guidance_adapters
-        self.setup_adapter_rewards(args, script_args)
 
         super().__init__(
             model=model,
@@ -491,6 +513,8 @@ class CustomGuidanceGRPOTrainer(Trainer):
             if isinstance(reward_func, PreTrainedModel):
                 self.reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
 
+        self.setup_adapter_rewards(args)
+
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
         # By default, this method sets `self._signature_columns` to the model's expected inputs.
@@ -556,46 +580,56 @@ class CustomGuidanceGRPOTrainer(Trainer):
             if is_peft_model(unwrapped_model):
                 unwrapped_model.unmerge_adapter()
 
+
+    def setup_adapter_rewards(self, args):
+
+        print(">> Setting up adapter-specific reward functions <<")
+
+        if hasattr(args, 'adapter_reward_mapping') and args.adapter_reward_mapping is not None:
+            self.adapter_reward_mapping = args.adapter_reward_mapping
+            logger.info(f"Using custom adapter reward mapping: {self.adapter_reward_mapping}")
+        else:
+            self.adapter_reward_mapping = {
+                "default": ["format", "accuracy", "tag_count"]
+            }
+            print(f">> Using default adapter reward mapping: {self.adapter_reward_mapping}")        
+
+        self.adapter_reward_funcs = {}
+        
+        for adapter_name, reward_func_names in self.adapter_reward_mapping.items():
+            self.adapter_reward_funcs[adapter_name] = []
+            for func_name in reward_func_names:
+                if func_name in self.reward_funcs_registry:
+                    self.adapter_reward_funcs[adapter_name].append(self.reward_funcs_registry[func_name])
+                else:
+                    raise ValueError(f"Reward function '{func_name}' not found in the reward functions registry.")
+
+            print(f">> [{adapter_name}] reward functions: {reward_func_names}")
+
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
 
         # [4DBG] Check for the REAL number of adapters -- successfully loaded (including default)
-        if not hasattr(self, '_adapters_checked'):
-
-            logger.info("=== REWARD FUNCTION DEBUG ===")
-            logger.info(f"Total reward functions: {len(self.reward_funcs)}")
+        if not hasattr(self, '_debug_logged'):
+            print("=" * 60)
+            print("=== REWARD FUNCTION DEBUG ===")
+            print(f">> [DBG] Total reward functions: {len(self.reward_funcs)}")
             for i, rf in enumerate(self.reward_funcs):
-                logger.info(f"Reward func {i}: {rf.__name__ if hasattr(rf, '__name__') else type(rf)}")
-            logger.info(f"Adapter reward mapping: {getattr(self, 'adapter_reward_mapping', 'NOT SET')}")
-            logger.info("=============================")
+                print(f">> [DBG] Reward func {i}: {rf.__name__ if hasattr(rf, '__name__') else type(rf)}")
+            print(f">> [DBG] Adapter reward mapping: {getattr(self, 'adapter_reward_mapping', 'NOT SET')}")
+            print("=" * 60)
+            self._debug_logged = True
 
-            # [4DBG] check loaded adapters
-            def _check_loaded_adapters(self):
-                logger.info("="*50)
-                logger.info(">> Checking loaded adapters... <<")
-
-                if hasattr(self.model, 'peft_config'):
-                    loaded_adapters = list(self.model.peft_config.keys())
-                    logger.info(f"Loaded adapters: {loaded_adapters}")
-                    logger.info(f"Activate Adapter: {self.model.active_adapter}")
-
-                    if "default" not in loaded_adapters:
-                        logger.warning(f"[[WARNING]] The default adapter is not loaded. Make sure to load it properly.")
-
-                    available_guidance_adapters = [name for name in self.guidance_adapter_names if name in loaded_adapters]
-                    logger.info(f"Available Guidance Adapters: {available_guidance_adapters}")
-
-                    self.args.guidance_adapter_names = available_guidance_adapters
-
-                else:
-                    logger.warning(f"[[WARNING]] The model does not have any adapters loaded. Make sure to load them properly.")
-                    self.args.guidance_adapter_names = []
-
-                logger.info(f"Final Adapter Count: {len(self.guidance_adapter_names)}")
-                logger.info("="*50)
-                
-            self._adapters_checked = True
-
-            _check_loaded_adapters(self)
+        # Check If adapters are loaded properly
+        if hasattr(self.model, 'peft_config'):
+            loaded_adapters = list(self.model.peft_config.keys())
+            print(f">> [DBG] Loaded adapters: {loaded_adapters}")
+            print(f">> [DBG] Active adapter: {self.model.active_adapter}")
+        
+        device = self.accelerator.device
+        prompts = [x["prompt"] for x in inputs]
+        prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
+        
+        print(f">> Processing {len(prompts)} prompts")
             
         device = self.accelerator.device
         prompts = [x["prompt"] for x in inputs]
@@ -639,6 +673,13 @@ class CustomGuidanceGRPOTrainer(Trainer):
             completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
             prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         else: 
+            print("="*50)
+            print(">> STARTING GENERATION PROCESS <<")
+            print(f">> [DBG] Generation batch size: {self.generation_batch_size}")
+            print(f">> [DBG] Total candidates per prompt: {self.num_generations}")
+            print(f">> [DBG] Main candidates: {self.num_candidates_main}")
+            print(f">> [DBG] Guidance candidates per adapter: {self.num_candidates_per_guidance}")
+            print("="*50)
             # Here we use the regular generation
             # Regular generation path
             all_generations = {"main": [], "guidance": {}}
@@ -648,9 +689,9 @@ class CustomGuidanceGRPOTrainer(Trainer):
                     prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
                 )
 
-                print(f">> Generation batch size: {generation_batch_size} <<")
-                print(f">> Total number of candidates to be generated per data: {self.num_generations} <<")
-                print(f">> Number of prompts in the current batch: {prompt_ids.size(0)} <<")
+                print(f">> [DBG] Generation batch size: {generation_batch_size} <<")
+                print(f">> [DBG] Total number of candidates to be generated per data: {self.num_generations} <<")
+                print(f">> [DBG] Number of prompts in the current batch: {prompt_ids.size(0)} <<")
 
                 # ==== 1. Main Adapter Generations(based on Accuracy--openrs baseline) ====
                 for i in range(0, self.args.num_candidates_main, generation_batch_size):
@@ -660,7 +701,7 @@ class CustomGuidanceGRPOTrainer(Trainer):
 
                     try:
                         unwrapped_model.set_adapter("default")
-                        logger.info(">> Switched to Main Adapter for generation. <<")
+                        print(">> Switched to Main Adapter for generation. <<")
                     except:
                         logger.warning(f"[[WARNING]] Could not switch to Main Adapter. Make sure the adapter is loaded properly.")
                         assert False
@@ -683,7 +724,7 @@ class CustomGuidanceGRPOTrainer(Trainer):
 
                         try:
                             unwrapped_model.set_adapter(adapter_name)
-                            logger.info(f">> Switched to adapter {adapter_name} for generation. <<")
+                            print(f">> Switched to adapter {adapter_name} for generation. <<")
                         except:
                             logger.warning(f"[[WARNING]] Could not switch to adapter {adapter_name}. Make sure the adapter is loaded properly.")
                             assert False
@@ -694,13 +735,13 @@ class CustomGuidanceGRPOTrainer(Trainer):
                         )
                         all_generations["guidance"][adapter_name].append(guidance_outputs)
                         all_generations["guidance"][adapter_name] = []
-                        logger.info(f">> Generated {guidance_outputs.shape[0]} sequences with adapter {adapter_name}. <<")
-                        logger.info(f">> Generated {self.args.num_candidates_per_guidance} Candidates for Each Prompt with adapter {adapter_name}. <<")
+                        print(f">> Generated {guidance_outputs.shape[0]} sequences with adapter {adapter_name}. <<")
+                        print(f">> Generated {self.args.num_candidates_per_guidance} Candidates for Each Prompt with adapter {adapter_name}. <<")
 
                     # Restore the main adapter after generation(SWITCH back to main adapter)
                     try:
                         unwrapped_model.set_adapter("default")
-                        logger.info(">> Restored to main adapter after guidance generations. <<")
+                        print(">> Restored to main adapter after guidance generations. <<")
                     except:
                         logger.warning(f"[[WARNING]] Could not restore to Main Adapter. Make sure the adapter is loaded properly.")
                         assert False
@@ -875,6 +916,8 @@ class CustomGuidanceGRPOTrainer(Trainer):
         # breakpoint()
 
         # ==== Computing Rewards and Advantages ====
+        print(">> [DBG] STARTING REWARD CALCULATION...")
+
         num_adapters = 1 + self.num_guidance_adapters  # main + diversity adapters
         rewards_per_func = torch.zeros(len(completions), len(self.reward_funcs), device=device)
         is_interactive = [("interactive" in rf.__class__.__name__.lower()) for rf in self.reward_funcs] # If the word "interactive" is in the reward function name
@@ -885,6 +928,7 @@ class CustomGuidanceGRPOTrainer(Trainer):
             * [self.num_candidates_per_guidance] * len(self.guidance_adapter_names) # for each guidance adapter
         ]
         # assert len(prompts) == len(completions)
+        print(f">> [DBG] Number of completions per adapter: {num_completions_per_adapter}")
 
         start_idx = 0
         all_advantages = []
@@ -899,6 +943,16 @@ class CustomGuidanceGRPOTrainer(Trainer):
                     adapter_name = "main"
                 else:
                     adapter_name = self.guidance_adapter_names[adapter_idx - 1]
+
+                print(f">> [DBG] [REWARD-{adapter_idx}] Computing rewards for adapter '{adapter_name}' Adapter....")
+                print(f">> [DBG] [REWARD-{adapter_idx}] Number of completions: {num_completions} <<")
+                print(f">> [DBG] [REWARD-{adapter_idx}] Processing Completion {start_idx} to {end_idx} <<")
+
+                if hasattr(self, 'adapter_reward_funcs') and adapter_name in self.adapter_reward_funcs:
+                    adapter_rewards = self.adapter_reward_funcs[adapter_name]
+                    print(f">> [DBG] [REWARD-{adapter_idx}] Using {len(adapter_rewards)} reward functions: {[rf.__name__ if hasattr(rf, '__name__') else str(rf) for rf in adapter_rewards]}")
+                else:
+                    print(f">> [DBG] [REWARD-{adapter_idx}] WARNING: No specific reward functions found, using default")
 
                 masked_prompts = prompts[start_idx:end_idx]
                 masked_completions = completions[start_idx:end_idx]
@@ -972,6 +1026,8 @@ class CustomGuidanceGRPOTrainer(Trainer):
                 # Store the Tensor Data
                 final_prompt_ids_list.append(prompt_ids[start_idx:end_idx])
                 completion_ids_list.append(completion_ids[start_idx:end_idx])
+
+                print(f">> [DBG] [REWARD-{adapter_idx}] Completed reward calculation for adapter '{adapter_name}' Adapter. <<")
 
             start_idx = end_idx
 
