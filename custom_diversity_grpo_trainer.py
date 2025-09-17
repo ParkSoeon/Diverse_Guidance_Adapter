@@ -967,8 +967,14 @@ class CustomGuidanceGRPOTrainer(Trainer):
                 advantages = rewards_per_func[start_idx:end_idx].sum(1) - grouped_rewards
                 all_advantages.append(advantages)
 
-                final_prompt_ids_list.append(masked_prompts)
-                completion_ids_list.append(masked_completions)
+                # final_prompt_ids_list.append(masked_prompts)
+                # completion_ids_list.append(masked_completions)
+
+                start_tensor_idx = start_idx
+                end_tensor_idx = end_idx
+
+                final_prompt_ids_list.append(prompt_ids[start_tensor_idx:end_tensor_idx])
+                completion_ids_list.append(completion_ids[start_tensor_idx:end_tensor_idx])
 
             start_idx = end_idx
             
@@ -1071,23 +1077,29 @@ class CustomGuidanceGRPOTrainer(Trainer):
         torch.int64
         """
         # breakpoint()
-        for batch_idx in range(num_batches):  
-            # Bring completion_ids and prompt_ids in current batch
-            current_completion_ids = completion_ids_list[batch_idx] # [B, Lc]
-            current_prompt_ids = final_prompt_ids_list[batch_idx] # [B, Lp]
-            current_ref_logps = ref_per_token_logps_list_input[i]  # [B, total_seq_len]
-            
-            B = current_completion_ids.size(0)
-            Lp = current_prompt_ids.size(1)
-            Lc = current_completion_ids.size(1)
-            
-            # Append to the lists
-            prompt_mask_list.append(torch.ones((B, Lp), dtype=torch.bool, device=current_prompt_ids.device))
-            completion_mask_list.append(torch.ones((B, Lc), dtype=torch.bool, device=current_completion_ids.device))
-            
-            completion_start = Lp
-            completion_end = Lp + Lc
-            ref_per_token_logps_list.append(current_ref_logps[:, completion_start:completion_end])
+        for batch_idx in range(len(final_prompt_ids_list)): # for each adapter
+            current_prompt_ids = final_prompt_ids_list[batch_idx]
+            current_completion_ids = completion_ids_list[batch_idx]
+
+            batch_size = len(current_completion_ids)
+            prompt_length = len(current_prompt_ids[0])
+            mlength = completion_ids.size(1)
+
+            prompt_mask_list.append(torch.ones((batch_size, prompt_length), dtype = torch.bool, device=device))
+            completion_mask_list.append(torch.ones((batch_size, mlength), dtype = torch.bool, device=device))
+
+            # Extract the Completion parts in ref_per_token_logps
+            completion_start = prompt_length
+            completion_end = prompt_length + mlength
+
+            # Extract ref_per_token_logps for the current batch
+            start_idx = sum(num_completions_per_adapter[:batch_idx])
+            end_idx = start_idx + num_completions_per_adapter[batch_idx]
+
+            batch_ref_logps = ref_per_token_logps[start_idx:end_idx, completion_start:completion_end]
+            ref_per_token_logps_list.append(batch_ref_logps)
+        
+
         """
         (Pdb) completion_ids.dtype
         torch.int64
@@ -1095,20 +1107,20 @@ class CustomGuidanceGRPOTrainer(Trainer):
         torch.Size([10, 1024])
         """
 
-        breakpoint()
+        # breakpoint()
         """
         All are lists
         (Pdb) len(final_prompt_ids_list)
         3
-        (Pdb) len(prompt_mask_list)
-        1
         (Pdb) len(completion_ids_list)
         3
-        (Pdb) len(completion_mask_list)
-        1
-        (Pdb) len(ref_per_token_logps_list)
-        1
         (Pdb) len(all_advantages)
+        3
+        (Pdb) len(completion_mask_list)
+        3
+        (Pdb) len(prompt_mask_list)
+        3
+        (Pdb) len(ref_per_token_logps_list)
         3
         """
 
@@ -1142,37 +1154,7 @@ class CustomGuidanceGRPOTrainer(Trainer):
             },
         }
 
-        breakpoint()
-
-        # return {
-        #     "main": { # 
-        #         "prompt_ids": final_prompt_ids,
-        #         "prompt_mask": expanded_prompt_mask, 
-        #         "completion_ids": completion_ids,
-        #         "completion_mask": completion_mask,
-        #         "old_per_token_logps": all_old_per_token_logps,
-        #         "ref_per_token_logps": all_ref_per_token_logps,
-        #         "advantages": all_advantages[0], # Need to be modified
-        #     },
-        #     "guidance_1": {
-        #         "prompt_ids": final_prompt_ids,
-        #         "prompt_mask": expanded_prompt_mask, 
-        #         "completion_ids": completion_ids,
-        #         "completion_mask": completion_mask,
-        #         "old_per_token_logps": all_old_per_token_logps,
-        #         "ref_per_token_logps": all_ref_per_token_logps,
-        #         "advantages": all_advantages[1], # Need to be modified
-        #     },
-        #     "guidance_2": {
-        #         "prompt_ids": final_prompt_ids,
-        #         "prompt_mask": expanded_prompt_mask, 
-        #         "completion_ids": completion_ids,
-        #         "completion_mask": completion_mask,
-        #         "old_per_token_logps": all_old_per_token_logps,
-        #         "ref_per_token_logps": all_ref_per_token_logps,
-        #         "advantages": all_advantages[2], # Need to be modified
-        #     },
-        # }
+        # breakpoint()
 
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -1180,30 +1162,59 @@ class CustomGuidanceGRPOTrainer(Trainer):
             raise ValueError("The GRPOTrainer does not support returning outputs")
         # Compute the per-token log probabilities for the model
 
-        prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
-        completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
-        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
-        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
+        total_loss = 0.0
+        num_adapters = 0
 
-        per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
+        # For each adapter, compute the loss separately and sum them up
+        for adapter_name, adapter_inputs in inputs.items():
+            prompt_ids, prompt_mask = adapter_inputs["prompt_ids"], adapter_inputs["prompt_mask"]
+            completion_ids, completion_mask = adapter_inputs["completion_ids"], adapter_inputs["completion_mask"]
+            input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+            attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+            logits_to_keep = completion_ids.size(1)
 
-        # Compute the KL divergence between the model and the reference model
-        ref_per_token_logps = inputs["ref_per_token_logps"]
-        per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+            per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
 
-        # x - x.detach() allows for preserving gradients from x
-        advantages = inputs["advantages"]
-        per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
-        per_token_loss = -(per_token_loss - self.beta * per_token_kl)
-        # loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
-        loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
-        # Log the metrics
-        completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
-        self._metrics["completion_length"].append(completion_length)
+            # Compute the KL divergence between the model and the reference model
+            ref_per_token_logps = adapter_inputs["ref_per_token_logps"]
+            """
+            (Pdb) per_token_logps.shape
+            torch.Size([6, 1024])
+            (Pdb) ref_per_token_logps.shape
+            torch.Size([6, 866]) -> This is weird... should be 1024 as well
+            (Pdb) completion_ids.shape
+            torch.Size([6, 1024])
+            (Pdb) completion_mask.shape
+            torch.Size([6, 1024])
 
-        mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
-        self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
+            (Pdb) prompt_ids.shape
+            torch.Size([6, 158])
+            (Pdb) input_ids.shape
+            torch.Size([6, 1182])
+            (Pdb) attention_mask.shape
+            torch.Size([6, 1182])
+            """
+            breakpoint()
+            per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+
+            # Compute the loss
+            advantages = adapter_inputs["advantages"]
+            per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
+            per_token_loss = -(per_token_loss - self.beta * per_token_kl)
+
+            adapter_loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
+            total_loss += adapter_loss
+            num_adapters += 1
+
+            # Logging 
+            if num_adapters == 1:
+                completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
+                self._metrics["completion_length"].append(completion_length)
+            
+                mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+                self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
+
+        loss = total_loss / num_adapters
 
         return loss
 
