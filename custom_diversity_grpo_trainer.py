@@ -247,13 +247,17 @@ class CustomGuidanceGRPOTrainer(Trainer):
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
         peft_config: Optional["PeftConfig"] = None,
     ):
+        
         # Args
         if args is None:
             model_name = model if isinstance(model, str) else model.config._name_or_path
+            
             model_name = model_name.split("/")[-1]
             args = GRPOConfig(f"{model_name}-GRPO")
         
-        
+        self.reward_funcs_registry = reward_funcs_registry or {}
+        print(f">> [DBG] Reward functions registry loaded with {len(self.reward_funcs_registry)} functions")
+
         self.extractor_name=args.extractor_name
         if args.extractor_name == 'jina':
             self.sentence_extractor = AutoModel.from_pretrained('jinaai/jina-embeddings-v2-small-en', trust_remote_code=True).cuda()
@@ -319,7 +323,6 @@ class CustomGuidanceGRPOTrainer(Trainer):
                     reward_func, num_labels=1, **model_init_kwargs
                 )
         self.reward_funcs = reward_funcs
-        self.reward_funcs_registry = reward_funcs_registry or {}
 
         # Reward weights
         if args.reward_weights is not None:
@@ -490,6 +493,7 @@ class CustomGuidanceGRPOTrainer(Trainer):
                 do_sample=True,
                 temperature=args.temperature,
                 pad_token_id=processing_class.pad_token_id,
+                # num_return_sequences=self.num_generations,
             )
 
         # Gradient accumulation requires scaled loss. Normally, loss scaling in the parent class depends on whether the
@@ -513,6 +517,7 @@ class CustomGuidanceGRPOTrainer(Trainer):
             if isinstance(reward_func, PreTrainedModel):
                 self.reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
 
+        print(f">> [DBG] Available registry keys: {list(self.reward_funcs_registry.keys())}")
         self.setup_adapter_rewards(args)
 
     def _set_signature_columns_if_needed(self):
@@ -579,7 +584,6 @@ class CustomGuidanceGRPOTrainer(Trainer):
             # This must be done after loading weights to ensure they correspond to the merged state.
             if is_peft_model(unwrapped_model):
                 unwrapped_model.unmerge_adapter()
-
 
     def setup_adapter_rewards(self, args):
 
@@ -673,10 +677,17 @@ class CustomGuidanceGRPOTrainer(Trainer):
             completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
             prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         else: 
+
+            def enforce_gen_config(model, k: int):
+                gc = model.generation_config
+                gc.num_return_sequences = k
+                gc.num_beams = 1
+                gc.do_sample = True
+                
             print("="*50)
             print(">> STARTING GENERATION PROCESS <<")
             print(f">> [DBG] Generation batch size: {self.generation_batch_size}")
-            print(f">> [DBG] Total candidates per prompt: {self.num_generations}")
+            print(f">> [DBG] Total candidates per data: {self.num_generations}")
             print(f">> [DBG] Main candidates: {self.num_candidates_main}")
             print(f">> [DBG] Guidance candidates per adapter: {self.num_candidates_per_guidance}")
             print("="*50)
@@ -706,6 +717,8 @@ class CustomGuidanceGRPOTrainer(Trainer):
                         logger.warning(f"[[WARNING]] Could not switch to Main Adapter. Make sure the adapter is loaded properly.")
                         assert False
 
+                    enforce_gen_config(unwrapped_model, self.num_candidates_main)
+
                     main_outputs = unwrapped_model.generate(
                         input_ids = batch_prompt_ids,
                         generation_config=self.generation_config,
@@ -729,6 +742,7 @@ class CustomGuidanceGRPOTrainer(Trainer):
                             logger.warning(f"[[WARNING]] Could not switch to adapter {adapter_name}. Make sure the adapter is loaded properly.")
                             assert False
 
+                        enforce_gen_config(unwrapped_model, self.num_candidates_per_guidance)
                         guidance_outputs = unwrapped_model.generate(
                             input_ids = batch_prompt_ids,
                             generation_config=self.generation_config,
@@ -998,6 +1012,9 @@ class CustomGuidanceGRPOTrainer(Trainer):
                         else:
                             texts = [p + c for p, c in zip(masked_prompts, masked_completions)]
 
+                        print(">> [DBG] [REWARD-{adapter_idx}] Computing rewards using model-based reward function...")
+                        print(">> [DBG] [REWARD-{adapter_idx}] Sample Input Num: ", len(texts))
+
                         reward_input = self.reward_processing_classes[0](
                             texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
                         )
@@ -1005,15 +1022,39 @@ class CustomGuidanceGRPOTrainer(Trainer):
 
                         with torch.inference_mode():
                             reward_values = reward_func(**reward_input).logits[:, 0]
+
+                        print(f">> [DBG] [REWARD-{adapter_idx}] Reward model returned {reward_values.shape[0]} values, expected {num_completions}")
+
                         assert reward_values.shape[0] == num_completions, f"[non-interactive] {reward_values.shape[0]} vs {num_completions}"
                         adapter_rewards_per_func[:, i] = reward_values
                     else:
                         keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
-                        reward_kwargs = {key: [ex[key] for ex in inputs] for key in keys}
-                        output = reward_func(prompts=masked_prompts, completions=masked_completions, **reward_kwargs)
-                        output = torch.tensor(output, dtype=torch.float32, device=device)
-                        assert output.shape[0] == num_completions, f"[non-interactive] {output.shape[0]} vs {num_completions}"
-                        adapter_rewards_per_func[:, i] = output
+                        masked_inputs = inputs[start_idx:end_idx]
+                        reward_kwargs = {key: [ex[key] for ex in masked_inputs] for key in keys}
+
+                        print(f">> [DBG] [REWARD-{adapter_idx}] Calling custom reward function with {len(masked_prompts)} prompts and {len(masked_completions)} completions")
+
+                try:
+                    output = reward_func(prompts=masked_prompts, completions=masked_completions, **reward_kwargs)
+                    print(f">> [DBG] [REWARD-{adapter_idx}] Custom reward function returned: {type(output)}, shape/len: {getattr(output, 'shape', len(output) if hasattr(output, '__len__') else 'unknown')}")
+                    
+                    output = torch.tensor(output, dtype=torch.float32, device=device)
+                    print(f">> [DBG] [REWARD-{adapter_idx}] Converted to tensor: {output.shape}, values: {output}")
+                    
+                    breakpoint()
+                    if output.shape[0] != num_completions:
+                        print(f">> [DBG] [REWARD-{adapter_idx}] ERROR: Expected {num_completions} values but got {output.shape[0]}")
+                        print(f">> [DBG] [REWARD-{adapter_idx}] masked_prompts length: {len(masked_prompts)}")
+                        print(f">> [DBG] [REWARD-{adapter_idx}] masked_completions length: {len(masked_completions)}")
+                        print(f">> [DBG] [REWARD-{adapter_idx}] reward_kwargs: {reward_kwargs}")
+                        
+                    assert output.shape[0] == num_completions, f"[custom reward] returned {output.shape[0]} but expected {num_completions}"
+                    adapter_rewards_per_func[:, i] = output
+                    
+                except Exception as e:
+                    print(f">> [DBG] [REWARD-{adapter_idx}] Exception in custom reward function: {e}")
+                    print(f">> [DBG] [REWARD-{adapter_idx}] Function name: {reward_func.__name__ if hasattr(reward_func, '__name__') else str(reward_func)}")
+                    raise
 
                 # Combine rewards from different reward functions for this adapter
                 adapter_total_rewards = adapter_rewards_per_func.sum(dim=1)
