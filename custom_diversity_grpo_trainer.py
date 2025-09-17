@@ -364,6 +364,7 @@ class CustomGuidanceGRPOTrainer(Trainer):
         self.generation_batch_size = args.generation_batch_size
         self.num_iterations = args.num_iterations
         self.num_guidance_adapters = args.num_guidance_adapters
+        self.setup_adapter_rewards(args, script_args)
 
         super().__init__(
             model=model,
@@ -559,6 +560,13 @@ class CustomGuidanceGRPOTrainer(Trainer):
 
         # [4DBG] Check for the REAL number of adapters -- successfully loaded (including default)
         if not hasattr(self, '_adapters_checked'):
+
+            logger.info("=== REWARD FUNCTION DEBUG ===")
+            logger.info(f"Total reward functions: {len(self.reward_funcs)}")
+            for i, rf in enumerate(self.reward_funcs):
+                logger.info(f"Reward func {i}: {rf.__name__ if hasattr(rf, '__name__') else type(rf)}")
+            logger.info(f"Adapter reward mapping: {getattr(self, 'adapter_reward_mapping', 'NOT SET')}")
+            logger.info("=============================")
 
             # [4DBG] check loaded adapters
             def _check_loaded_adapters(self):
@@ -887,37 +895,85 @@ class CustomGuidanceGRPOTrainer(Trainer):
             end_idx = start_idx + num_completions
 
             if num_completions > 0:
+                if adapter_idx == 0:
+                    adapter_name = "main"
+                else:
+                    adapter_name = self.guidance_adapter_names[adapter_idx - 1]
+
                 masked_prompts = prompts[start_idx:end_idx]
                 masked_completions = completions[start_idx:end_idx]
                 assert len(masked_prompts) == len(masked_completions) == num_completions
 
-                # Interactive Rewards first
-                for i, (reward_func, reward_processing_class) in enumerate(zip(self.reward_funcs, self.reward_processing_classes)):
-                    if not is_interactive[i]: # non-interactive reward functions will just compare completions within the same group from each adapter
-                        continue
+                # Compute Rewards with the specified? speciallized? reward functions
+                adapter_rewards = self.adapter_reward_funcs[adapter_name]
+                adapter_rewards_per_func = torch.zeros(num_completions, len(adapter_rewards), device=device)
 
-                    if isinstance(reward_func, nn.Module): 
+                # # Interactive Rewards first
+                # for i, (reward_func, reward_processing_class) in enumerate(zip(self.reward_funcs, self.reward_processing_classes)):
+                #     if not is_interactive[i]: # non-interactive reward functions will just compare completions within the same group from each adapter
+                #         continue
+
+                #     if isinstance(reward_func, nn.Module): 
+                #         if is_conversational(inputs[0]): # conversational-style completions
+                #             messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
+                #             texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
+                #         else:
+                #             texts = [p + c for p, c in zip(prompts, completions)]
+
+                #         reward_input = reward_processing_class( # entire text = prompt + completion
+                #             texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
+                #         )
+                #         reward_input = super()._prepare_inputs(reward_input)
+                #         with torch.inference_mode():
+                #             reward_values = reward_func(**reward_input).logits[:, 0]  # (M,)
+                #         assert reward_values.shape[0] == len(completions), f"[interactive] returned {reward_values.shape[0]} but expected {len(completions)}."
+                #         rewards_per_func[:, i] = reward_values
+                #     else:
+                #         keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
+                #         reward_kwargs = {key: [ex[key] for ex in inputs] for key in keys}
+                #         output = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
+                #         output = torch.tensor(output, dtype=torch.float32, device=device)
+                #         assert output.shape[0] == len(completions), f"[interactive] returned {output.shape[0]} but expected {len(completions)}."
+                #         rewards_per_func[:, i] = output
+
+                for i, reward_func in enumerate(adapter_rewards):
+                    if isinstance(reward_func, nn.Module):
                         if is_conversational(inputs[0]): # conversational-style completions
-                            messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
-                            texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
+                            messages = [{"messages": p + c} for p, c in zip(masked_prompts, masked_completions)]
+                            texts = [apply_chat_template(x, self.adapter_reward_processing_classes[adapter_name][i])["text"] for x in messages]
                         else:
-                            texts = [p + c for p, c in zip(prompts, completions)]
+                            texts = [p + c for p, c in zip(masked_prompts, masked_completions)]
 
-                        reward_input = reward_processing_class( # entire text = prompt + completion
+                        reward_input = self.reward_processing_classes[0](
                             texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
                         )
                         reward_input = super()._prepare_inputs(reward_input)
+
                         with torch.inference_mode():
-                            reward_values = reward_func(**reward_input).logits[:, 0]  # (M,)
-                        assert reward_values.shape[0] == len(completions), f"[interactive] returned {reward_values.shape[0]} but expected {len(completions)}."
-                        rewards_per_func[:, i] = reward_values
+                            reward_values = reward_func(**reward_input).logits[:, 0]
+                        assert reward_values.shape[0] == num_completions, f"[non-interactive] {reward_values.shape[0]} vs {num_completions}"
+                        adapter_rewards_per_func[:, i] = reward_values
                     else:
                         keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
                         reward_kwargs = {key: [ex[key] for ex in inputs] for key in keys}
-                        output = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
+                        output = reward_func(prompts=masked_prompts, completions=masked_completions, **reward_kwargs)
                         output = torch.tensor(output, dtype=torch.float32, device=device)
-                        assert out.shape[0] == len(completions), f"[interactive] returned {out.shape[0]} but expected {len(completions)}."
-                        rewards_per_func[:, i] = output
+                        assert output.shape[0] == num_completions, f"[non-interactive] {output.shape[0]} vs {num_completions}"
+                        adapter_rewards_per_func[:, i] = output
+
+                # Combine rewards from different reward functions for this adapter
+                adapter_total_rewards = adapter_rewards_per_func.sum(dim=1)
+
+                # Compute advantages 
+                mean_rewards = adapter_total_rewards.mean()
+                advantages = adapter_total_rewards - mean_rewards
+                all_advantages.append(advantages)
+
+                # Store the Tensor Data
+                final_prompt_ids_list.append(prompt_ids[start_idx:end_idx])
+                completion_ids_list.append(completion_ids[start_idx:end_idx])
+
+            start_idx = end_idx
 
         debug_masks = {}
         for adapter_idx, num_completions in enumerate(num_completions_per_adapter): # for each adapter
@@ -1081,23 +1137,50 @@ class CustomGuidanceGRPOTrainer(Trainer):
             current_prompt_ids = final_prompt_ids_list[batch_idx]
             current_completion_ids = completion_ids_list[batch_idx]
 
-            batch_size = len(current_completion_ids)
-            prompt_length = len(current_prompt_ids[0])
-            mlength = completion_ids.size(1)
+            batch_size = current_completion_ids.size(0)
+            prompt_length = current_completion_ids.size(1)
+            completion_length = current_completion_ids.size(1)
 
             prompt_mask_list.append(torch.ones((batch_size, prompt_length), dtype = torch.bool, device=device))
-            completion_mask_list.append(torch.ones((batch_size, mlength), dtype = torch.bool, device=device))
+            completion_mask_list.append(torch.ones((batch_size, completion_length), dtype = torch.bool, device=device))
 
-            # Extract the Completion parts in ref_per_token_logps
-            completion_start = prompt_length
-            completion_end = prompt_length + mlength
+            current_input_ids = torch.cat([current_prompt_ids, current_completion_ids], dim=1)
+            current_attention_mask = torch.cat([
+                torch.ones_like(current_prompt_ids, dtype=torch.bool),
+                torch.ones_like(current_completion_ids, dtype=torch.bool),
+            ], dim=1)
+            current_logits_to_keep = current_completion_ids.size(1)
 
-            # Extract ref_per_token_logps for the current batch
-            start_idx = sum(num_completions_per_adapter[:batch_idx])
-            end_idx = start_idx + num_completions_per_adapter[batch_idx]
+            with torch.inference_mode():
+                if self.ref_model is not None:
+                    current_ref_logps = self._get_per_token_logps(
+                        self.ref_model, current_input_ids, current_attention_mask, current_logits_to_keep
+                    )
+                else:
+                    with self.accelerator.unwrap_model(self.model).disable_adapter():
+                        current_ref_logps = self._get_per_token_logps(
+                            self.model, current_input_ids, current_attention_mask, current_logits_to_keep
+                        )
 
-            batch_ref_logps = ref_per_token_logps[start_idx:end_idx, completion_start:completion_end]
-            ref_per_token_logps_list.append(batch_ref_logps)
+            ref_per_token_logps_list.append(current_ref_logps)
+
+            # batch_size = len(current_completion_ids)
+            # prompt_length = len(current_prompt_ids[0])
+            # mlength = completion_ids.size(1)
+
+            # prompt_mask_list.append(torch.ones((batch_size, prompt_length), dtype = torch.bool, device=device))
+            # completion_mask_list.append(torch.ones((batch_size, mlength), dtype = torch.bool, device=device))
+
+            # # Extract the Completion parts in ref_per_token_logps
+            # completion_start = prompt_length
+            # completion_end = prompt_length + mlength
+
+            # # Extract ref_per_token_logps for the current batch
+            # start_idx = sum(num_completions_per_adapter[:batch_idx])
+            # end_idx = start_idx + num_completions_per_adapter[batch_idx]
+
+            # batch_ref_logps = ref_per_token_logps[start_idx:end_idx, completion_start:completion_end]
+            # ref_per_token_logps_list.append(batch_ref_logps)
         
 
         """
@@ -1181,7 +1264,7 @@ class CustomGuidanceGRPOTrainer(Trainer):
             (Pdb) per_token_logps.shape
             torch.Size([6, 1024])
             (Pdb) ref_per_token_logps.shape
-            torch.Size([6, 866]) -> This is weird... should be 1024 as well
+            torch.Size([6, 1024]) -> This is weird... should be 1024 as well
             (Pdb) completion_ids.shape
             torch.Size([6, 1024])
             (Pdb) completion_mask.shape
@@ -1194,7 +1277,7 @@ class CustomGuidanceGRPOTrainer(Trainer):
             (Pdb) attention_mask.shape
             torch.Size([6, 1182])
             """
-            breakpoint()
+            # breakpoint()
             per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
 
             # Compute the loss
