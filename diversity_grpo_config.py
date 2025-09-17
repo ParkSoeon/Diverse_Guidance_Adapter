@@ -13,15 +13,16 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import Optional, Union
+from typing import Optional, Union, Any, Dict, List
 
-import transformers
 from packaging import version
 from transformers import TrainingArguments
-
+# from trl import GRPOConfig
+from src.open_r1.trl import GRPOConfig
 
 @dataclass
-class GRPOConfig(TrainingArguments):
+# class GRPOConfig(trl.GRPOConfig):
+class GRPOConfig(GRPOConfig):
     r"""
     Configuration class for the [`GRPOTrainer`].
 
@@ -250,7 +251,7 @@ class GRPOConfig(TrainingArguments):
         },
     )
     num_generations: Optional[int] = field(
-        default=8,
+        default=10,
         metadata={
             "help": "Number of generations to sample. The effective batch size (num_processes * per_device_batch_size "
             "* gradient_accumulation_steps) must be evenly divisible by this value."
@@ -354,14 +355,6 @@ class GRPOConfig(TrainingArguments):
         default=0.2,
         metadata={"help": "Epsilon value for clipping."},
     )
-    delta: Optional[float] = field(
-        default=None,
-        metadata={
-            "help": "Enables the upper clipping bound in two-sided GRPO loss when set to a float. If `None` "
-            "(default), standard GRPO clipping is used. Recommended to be greater than `1 + ε` when enabled. This "
-            "method is introduced in the [INTELLECT-2 tech report](https://huggingface.co/papers/2505.07291)."
-        },
-    )
     epsilon_high: Optional[float] = field(
         default=None,
         metadata={
@@ -379,6 +372,38 @@ class GRPOConfig(TrainingArguments):
             "sequence-level rewards."
         },
     )
+
+    # Reward-related parameters
+    adapter_reward_mapping: Optional[Dict[str, List[str]]] = field(
+        default=None,
+        metadata={
+            "help": "Mapping of adapter names to their reward functions. "
+                   "Format: {'main': ['accuracy', 'format'], 'adapter_0': ['diversity_reward_1']}"
+        }
+    )
+    main_reward_funcs: list[str] = field(
+        default_factory=lambda: ["accuracy", "format", "tag_count"],
+        metadata={
+            "help": "Names of the main reward functions to use. Supported values are: 'accuracy', 'format', "
+            "'tag_count', 'bert_score', 'bleu_score', 'rouge_score', 'meteor_score', 'chrf_score', 'comet_score', "
+            "'sentence_bleu_score', 'sacrebleu_score'. You can also provide the name of a custom reward function "
+            "defined in `trl.reward.modeling_rewards`."
+        },
+    )
+    # guidance_1_reward_funcs: list[str] = field(
+    #     default_factory=lambda: ["interactive_bleu", "negative_bleu_reward_func", "bleu_in_denominator_reward_func", "one_minus_bleu_reward_func", "smi_reward_func", "bleu_difference_reward_func"],
+    #     metadata={"help": "Names of the reward functions to use for the first guidance adapter."},
+    # )
+    # guidance_2_reward_funcs: list[str] = field(
+    #     default_factory=lambda: ["interactive_rouge", "negative_bleu_reward_func", "bleu_in_denominator_reward_func", "one_minus_bleu_reward_func", "smi_reward_func", "bleu_difference_reward_func"],
+    #     metadata={"help": "Names of the reward functions to use for the second guidance adapter."},
+    # )
+
+    guidance_reward_function_opt: list[str] = field(
+        default_factory=lambda: ["interactive_rouge", "negative_bleu_reward_func", "bleu_in_denominator_reward_func", "one_minus_bleu_reward_func", "smi_reward_func", "bleu_difference_reward_func"],
+        metadata={"help": "Names of the reward functions to use for the second guidance adapter."},
+    )
+
     reward_weights: Optional[list[float]] = field(
         default=None,
         metadata={
@@ -425,7 +450,11 @@ class GRPOConfig(TrainingArguments):
             "synchronized with the reference policy. To use this parameter, you must set `sync_ref_model=True`."
         },
     )
-
+    system_prompt: Optional[str] = field(
+        default=None,
+        metadata={"help": "The optional system prompt to use."},
+    )
+    
     # Parameters that control the logging
     log_completions: bool = field(
         default=False,
@@ -434,7 +463,6 @@ class GRPOConfig(TrainingArguments):
             "installed, it prints the sample. If `wandb` logging is enabled, it logs it to `wandb`."
         },
     )
-
     num_guidance_adapters: int = field(
         default=2,
         metadata={
@@ -453,3 +481,63 @@ class GRPOConfig(TrainingArguments):
             "help": "Number of candidate generations to use for each guidance adapter."
         },
     )
+    
+    # Names of Guidance Adapters (It would have less possibilities to make mistakes for me......)
+    guidance_adapter_names: list[str] = field(
+        default_factory=lambda: ["guidance_adapter_0", "guidance_adapter_1"],
+        metadata={
+            "help": "Names of the guidance adapters. If the length of this list does not match `num_guidance_adapters`, "
+            "the names will be automatically generated as `adapter_1`, `adapter_2`, etc."
+        },
+    )
+
+    # Loss Configuration
+    loss_type: str = field(default="grpo")
+    importance_sampling_level: str = field(default="token")
+
+    wandb_project: str = None
+    wandb_entity: str = None
+
+    gradient_checkpointing: bool = field(
+        default=True,
+        metadata={"help": "Whether to use gradient checkpointing to save memory at the expense of slower backward pass."},
+    )
+
+    chat_template: Optional[str] = field(
+        default=True,
+        metadata={
+            "help": "Chat template to use for formatting the prompts. If not provided, a default template will be used."
+        },
+    )
+
+    callbacks: list[str] = field(
+        default_factory=lambda: [], metadata={"help": "The callbacks to run during training."}
+    )
+
+    def __post_init__(self):
+        """ Post-initialization checks and adjustments. """
+        super().__post_init__()
+
+        # Validate Adapter Configuration
+        total_candidates = self.num_candidates_main + (
+            self.num_candidates_per_guidance * self.num_guidance_adapters
+        )
+        if total_candidates != self.num_generations:
+            raise ValueError(
+                f"The total number of candidates ({total_candidates}) must equal num_generations ({self.num_generations})."
+                f"[CHECK] {self.num_candidates_main} + {self.num_candidates_per_guidance} * {self.num_guidance_adapters} = TOTAL {total_candidates}"
+            )
+
+        # Set epsilon_high Default
+        if self.epsilon_high is None:
+            self.epsilon_high = self.epsilon
+        
+        # Validate for Guidance Adapter names
+        if len(self.guidance_adapter_names) != self.num_guidance_adapters:
+            self.guidance_adapter_names = [
+                f"diversity_guidance_adapter_{i}" for i in range(self.num_guidance_adapters)
+            ]
+        
+        if self.gradient_checkpointing:
+            if hasattr(self, 'use_cache'):
+                self.use_cache = False 
