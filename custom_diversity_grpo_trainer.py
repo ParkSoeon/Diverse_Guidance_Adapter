@@ -493,7 +493,6 @@ class CustomGuidanceGRPOTrainer(Trainer):
                 do_sample=True,
                 temperature=args.temperature,
                 pad_token_id=processing_class.pad_token_id,
-                # num_return_sequences=self.num_generations,
             )
 
         # Gradient accumulation requires scaled loss. Normally, loss scaling in the parent class depends on whether the
@@ -619,6 +618,15 @@ class CustomGuidanceGRPOTrainer(Trainer):
             print(f">> [DBG] Total reward functions: {len(self.reward_funcs)}")
             for i, rf in enumerate(self.reward_funcs):
                 print(f">> [DBG] Reward func {i}: {rf.__name__ if hasattr(rf, '__name__') else type(rf)}")
+
+            # if hasattr(self, "adapter_reward_mapping"):
+            #     print(">> [DBG] Adapter -> Reward mapping:")
+            #     for adapter, rf_indices in self.adapter_reward_mapping.items():
+            #         mapped = [self.reward_funcs[idx].__name__ if hasattr(self.reward_funcs[idx], "__name__") else type(self.reward_funcs[idx]) for idx in rf_indices]
+            #         print(f"   - {adapter}: {mapped}")
+            # else:
+            #     print(">> [DBG] Adapter reward mapping: NOT SET")
+                
             print(f">> [DBG] Adapter reward mapping: {getattr(self, 'adapter_reward_mapping', 'NOT SET')}")
             print("=" * 60)
             self._debug_logged = True
@@ -647,6 +655,8 @@ class CustomGuidanceGRPOTrainer(Trainer):
         if self.max_prompt_length is not None:
             prompt_ids = prompt_ids[:, -self.max_prompt_length :]
             prompt_mask = prompt_mask[:, -self.max_prompt_length :]
+            
+        
 
         # Generate completions using either vLLM or regular generation
         if self.args.use_vllm == True:
@@ -677,12 +687,6 @@ class CustomGuidanceGRPOTrainer(Trainer):
             completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
             prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         else: 
-
-            def enforce_gen_config(model, k: int):
-                gc = model.generation_config
-                gc.num_return_sequences = k
-                gc.num_beams = 1
-                gc.do_sample = True
                 
             print("="*50)
             print(">> STARTING GENERATION PROCESS <<")
@@ -696,9 +700,9 @@ class CustomGuidanceGRPOTrainer(Trainer):
             all_generations = {"main": [], "guidance": {}}
             with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
                 generation_batch_size = self.generation_batch_size
-                prompt_completion_ids = unwrapped_model.generate(
-                    prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
-                )
+                # prompt_completion_ids = unwrapped_model.generate(
+                #     prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
+                # )
 
                 print(f">> [DBG] Generation batch size: {generation_batch_size} <<")
                 print(f">> [DBG] Total number of candidates to be generated per data: {self.num_generations} <<")
@@ -706,7 +710,8 @@ class CustomGuidanceGRPOTrainer(Trainer):
 
                 # ==== 1. Main Adapter Generations(based on Accuracy--openrs baseline) ====
                 for i in range(0, self.args.num_candidates_main, generation_batch_size):
-                    end_idx = min(i + generation_batch_size, prompt_ids.size(0))
+                    # end_idx = min(i + generation_batch_size, prompt_ids.size(0))
+                    end_idx = min(i + generation_batch_size, self.args.num_candidates_main)
                     batch_prompt_ids = prompt_ids[i:end_idx].to(device)
                     # batch_size = batch_prompt_ids.size(0)
 
@@ -717,21 +722,22 @@ class CustomGuidanceGRPOTrainer(Trainer):
                         logger.warning(f"[[WARNING]] Could not switch to Main Adapter. Make sure the adapter is loaded properly.")
                         assert False
 
-                    enforce_gen_config(unwrapped_model, self.num_candidates_main)
-
+                    unwrapped_model.gradient_checkpointing_disable()
                     main_outputs = unwrapped_model.generate(
                         input_ids = batch_prompt_ids,
                         generation_config=self.generation_config,
                     )
+                    unwrapped_model.gradient_checkpointing_enable()
+
                     all_generations["main"].append(main_outputs)
-                    logger.info(f">> Generated {main_outputs.shape[0]} sequences with main adapter. <<")
+                    print(f">> Generated {main_outputs.shape[0]} sequences with main adapter. <<")
 
                 # ==== 2. Diversity Guidance Generations (based on Diversity Guidance) ====
                 for adapter_name in self.guidance_adapter_names:
                     all_generations["guidance"][adapter_name] = []
 
                     for i in range(0, self.args.num_candidates_per_guidance, generation_batch_size):
-                        end_idx = min(i + generation_batch_size, prompt_ids.size(0))
+                        end_idx = min(i + generation_batch_size, self.args.num_candidates_per_guidance)
                         batch_prompt_ids = prompt_ids[i:end_idx].to(device)
                         # batch_size = batch_prompt_ids.size(0)
 
@@ -742,13 +748,15 @@ class CustomGuidanceGRPOTrainer(Trainer):
                             logger.warning(f"[[WARNING]] Could not switch to adapter {adapter_name}. Make sure the adapter is loaded properly.")
                             assert False
 
-                        enforce_gen_config(unwrapped_model, self.num_candidates_per_guidance)
+                        unwrapped_model.gradient_checkpointing_disable()
                         guidance_outputs = unwrapped_model.generate(
                             input_ids = batch_prompt_ids,
                             generation_config=self.generation_config,
                         )
+                        unwrapped_model.gradient_checkpointing_enable()
+
                         all_generations["guidance"][adapter_name].append(guidance_outputs)
-                        all_generations["guidance"][adapter_name] = []
+
                         print(f">> Generated {guidance_outputs.shape[0]} sequences with adapter {adapter_name}. <<")
                         print(f">> Generated {self.args.num_candidates_per_guidance} Candidates for Each Prompt with adapter {adapter_name}. <<")
 
@@ -855,7 +863,7 @@ class CustomGuidanceGRPOTrainer(Trainer):
         (Pdb) completion_ids.dtype
         torch.int64
         """
-
+        breakpoint()
         # Concatenate prompt_mask with completion_mask for logit computation
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B*G, P+C)
         """
@@ -1031,30 +1039,31 @@ class CustomGuidanceGRPOTrainer(Trainer):
                         keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
                         masked_inputs = inputs[start_idx:end_idx]
                         reward_kwargs = {key: [ex[key] for ex in masked_inputs] for key in keys}
-
+                        # output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
+                        # rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
                         print(f">> [DBG] [REWARD-{adapter_idx}] Calling custom reward function with {len(masked_prompts)} prompts and {len(masked_completions)} completions")
 
-                try:
-                    output = reward_func(prompts=masked_prompts, completions=masked_completions, **reward_kwargs)
-                    print(f">> [DBG] [REWARD-{adapter_idx}] Custom reward function returned: {type(output)}, shape/len: {getattr(output, 'shape', len(output) if hasattr(output, '__len__') else 'unknown')}")
-                    
-                    output = torch.tensor(output, dtype=torch.float32, device=device)
-                    print(f">> [DBG] [REWARD-{adapter_idx}] Converted to tensor: {output.shape}, values: {output}")
-                    
-                    breakpoint()
-                    if output.shape[0] != num_completions:
-                        print(f">> [DBG] [REWARD-{adapter_idx}] ERROR: Expected {num_completions} values but got {output.shape[0]}")
-                        print(f">> [DBG] [REWARD-{adapter_idx}] masked_prompts length: {len(masked_prompts)}")
-                        print(f">> [DBG] [REWARD-{adapter_idx}] masked_completions length: {len(masked_completions)}")
-                        print(f">> [DBG] [REWARD-{adapter_idx}] reward_kwargs: {reward_kwargs}")
+                        try:
+                            output = reward_func(prompts=masked_prompts, completions=masked_completions, **reward_kwargs)
+                            print(f">> [DBG] [REWARD-{adapter_idx}] Custom reward function returned: {type(output)}, shape/len: {getattr(output, 'shape', len(output) if hasattr(output, '__len__') else 'unknown')}")
+                            
+                            output = torch.tensor(output, dtype=torch.float32, device=device)
+                            print(f">> [DBG] [REWARD-{adapter_idx}] Converted to tensor: {output.shape}, values: {output}")
+                            
+                            breakpoint()
+                            if output.shape[0] != num_completions:
+                                print(f">> [DBG] [REWARD-{adapter_idx}] ERROR: Expected {num_completions} values but got {output.shape[0]}")
+                                print(f">> [DBG] [REWARD-{adapter_idx}] masked_prompts length: {len(masked_prompts)}")
+                                print(f">> [DBG] [REWARD-{adapter_idx}] masked_completions length: {len(masked_completions)}")
+                                print(f">> [DBG] [REWARD-{adapter_idx}] reward_kwargs: {reward_kwargs}")
+                                
+                            assert output.shape[0] == num_completions, f"[custom reward] returned {output.shape[0]} but expected {num_completions}"
+                            adapter_rewards_per_func[:, i] = output
                         
-                    assert output.shape[0] == num_completions, f"[custom reward] returned {output.shape[0]} but expected {num_completions}"
-                    adapter_rewards_per_func[:, i] = output
-                    
-                except Exception as e:
-                    print(f">> [DBG] [REWARD-{adapter_idx}] Exception in custom reward function: {e}")
-                    print(f">> [DBG] [REWARD-{adapter_idx}] Function name: {reward_func.__name__ if hasattr(reward_func, '__name__') else str(reward_func)}")
-                    raise
+                        except Exception as e:
+                            print(f">> [DBG] [REWARD-{adapter_idx}] Exception in custom reward function: {e}")
+                            print(f">> [DBG] [REWARD-{adapter_idx}] Function name: {reward_func.__name__ if hasattr(reward_func, '__name__') else str(reward_func)}")
+                            raise
 
                 # Combine rewards from different reward functions for this adapter
                 adapter_total_rewards = adapter_rewards_per_func.sum(dim=1)
@@ -1361,7 +1370,7 @@ class CustomGuidanceGRPOTrainer(Trainer):
             (Pdb) per_token_logps.shape
             torch.Size([6, 1024])
             (Pdb) ref_per_token_logps.shape
-            torch.Size([6, 1024]) -> This is weird... should be 1024 as well
+            torch.Size([6, 1024]) 
             (Pdb) completion_ids.shape
             torch.Size([6, 1024])
             (Pdb) completion_mask.shape
