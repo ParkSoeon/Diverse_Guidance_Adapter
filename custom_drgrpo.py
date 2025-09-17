@@ -43,19 +43,18 @@ from src.open_r1.utils.callbacks import get_callbacks
 from src.open_r1.utils.wandb_logging import init_wandb_training
 from src.open_r1.trl import DRGRPOTrainer,GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
 
-
-from sentence_transformers import SentenceTransformer
-import torch.nn.functional as F
-
-from src.open_r1.custom_drgrpo_trainer import CustomGuidanceGRPOTrainer
-
-from src.open_r1.diversity_reward_funcs import (
+from src.open_r1.diversity_reward_func import (
     interactive_negative_bleu_reward_func,
     interactive_bleu_in_denominator_reward_func,
     interactive_one_minus_bleu_reward_func,
     smi_reward_func,
     interactive_bleu_difference_reward_func
 )
+
+from sentence_transformers import SentenceTransformer
+import torch.nn.functional as F
+
+from src.open_r1.custom_drgrpo_trainer import CustomGuidanceGRPOTrainer
 
 logger = logging.getLogger(__name__)
 
@@ -134,45 +133,6 @@ def set_run_name(training_args, script_args, model_args):
         )
     return training_args.run_name
 
-def setup_adapter_rewards(self, args, script_args):
-    REWARD_FUNCS_REGISTRY = {
-        "accuracy": accuracy_reward,
-        "format": format_reward,
-        "reasoning_steps": reasoning_steps_reward,
-        "cosine": get_cosine_scaled_reward(
-            min_value_wrong=script_args.cosine_min_value_wrong,
-            max_value_wrong=script_args.cosine_max_value_wrong,
-            min_value_correct=script_args.cosine_min_value_correct,
-            max_value_correct=script_args.cosine_max_value_correct,
-            max_len=script_args.cosine_max_len,
-        ),
-        "repetition_penalty": get_repetition_penalty_reward(
-            ngram_size=script_args.repetition_n_grams,
-            max_penalty=script_args.repetition_max_penalty,
-        ),
-        "length": len_reward,
-        "code": code_reward,
-        "code_format": get_code_format_reward(language=script_args.code_language),
-        "tag_count": tag_count_reward,
-        "interactive_negative_bleu_reward_func": interactive_negative_bleu_reward_func,
-        "interactive_bleu_in_denominator_reward_func": interactive_bleu_in_denominator_reward_func,
-        "interactive_one_minus_bleu_reward_func": interactive_one_minus_bleu_reward_func,
-        "smi_reward_func": smi_reward_func,
-        "interactive_bleu_difference_reward_func": interactive_bleu_difference_reward_func
-    }
-
-    if hasattr(args, 'adapter_reward_mapping') and args.adapter_reward_mapping is not None:
-        self.adapter_reward_mapping = args.adapter_reward_mapping
-        logger.info(f"Using custom adapter reward mapping: {self.adapter_reward_mapping}")
-    else:
-        self.adapter_reward_mapping = {"main": script_args.reward_funcs}
-    
-    self.adapter_reward_funcs = {}
-    for adapter_name, reward_func_names in self.adapter_reward_mapping.items():
-        self.adapter_reward_funcs[adapter_name] = [REWARD_FUNCS_REGISTRY[func] for func in reward_func_names]
-
-    logger.info(f"Adapter reward functions: {self.adapter_reward_mapping}")
-
 def main(script_args, training_args, model_args):
     # Set seed for reproducibility
     set_seed(training_args.seed)
@@ -225,26 +185,31 @@ def main(script_args, training_args, model_args):
     tokenizer = get_tokenizer(model_args, training_args)
 
     # Get reward functions
-    # REWARD_FUNCS_REGISTRY = {
-    #     "accuracy": accuracy_reward,
-    #     "format": format_reward,
-    #     "reasoning_steps": reasoning_steps_reward,
-    #     "cosine": get_cosine_scaled_reward(
-    #         min_value_wrong=script_args.cosine_min_value_wrong,
-    #         max_value_wrong=script_args.cosine_max_value_wrong,
-    #         min_value_correct=script_args.cosine_min_value_correct,
-    #         max_value_correct=script_args.cosine_max_value_correct,
-    #         max_len=script_args.cosine_max_len,
-    #     ),
-    #     "repetition_penalty": get_repetition_penalty_reward(
-    #         ngram_size=script_args.repetition_n_grams,
-    #         max_penalty=script_args.repetition_max_penalty,
-    #     ),
-    #     "length": len_reward,
-    #     "code": code_reward,
-    #     "code_format": get_code_format_reward(language=script_args.code_language),
-    #     "tag_count": tag_count_reward,
-    # }
+    REWARD_FUNCS_REGISTRY = {
+        "accuracy": accuracy_reward,
+        "format": format_reward,
+        "reasoning_steps": reasoning_steps_reward,
+        "cosine": get_cosine_scaled_reward(
+            min_value_wrong=script_args.cosine_min_value_wrong,
+            max_value_wrong=script_args.cosine_max_value_wrong,
+            min_value_correct=script_args.cosine_min_value_correct,
+            max_value_correct=script_args.cosine_max_value_correct,
+            max_len=script_args.cosine_max_len,
+        ),
+        "repetition_penalty": get_repetition_penalty_reward(
+            ngram_size=script_args.repetition_n_grams,
+            max_penalty=script_args.repetition_max_penalty,
+        ),
+        "length": len_reward,
+        "code": code_reward,
+        "code_format": get_code_format_reward(language=script_args.code_language),
+        "tag_count": tag_count_reward,
+        "interactive_negative_bleu_reward_func": interactive_negative_bleu_reward_func,
+        "interactive_bleu_in_denominator_reward_func": interactive_bleu_in_denominator_reward_func,
+        "interactive_one_minus_bleu_reward_func": interactive_one_minus_bleu_reward_func,
+        "smi_reward_func": smi_reward_func,
+        "interactive_bleu_difference_reward_func": interactive_bleu_difference_reward_func
+    }
     reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
 
     # Format into conversation
