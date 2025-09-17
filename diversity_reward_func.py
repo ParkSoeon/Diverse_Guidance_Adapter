@@ -1,21 +1,52 @@
+import numpy as np
+import torch
 from collections import Counter
 from sentence_transformers import SentenceTransformer
 import torch
 from sklearn.metrics.pairwise import cosine_similarity
-from reward_func import extract_xml_answer, extract_hash_answer
 import nltk
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from typing import List, Dict, Any, Optional
 
-# Purpose: 일단 ~~~ 최대한 다양한 funcs 만들기
-
+# Initializing Smoothing for BLEU
 smoothing = SmoothingFunction().method1
 
-# Tokenize
+# Cache for SentenceTransformer model
+_cached_model = None
+
+def get_sentence_transformer():
+    global _cached_model
+    if _cached_model is None:
+        _cached_model = SentenceTransformer('all-MiniLM-L6-v2')
+    return _cached_model
+
+def extract_content(response: Any) -> str:
+    """ Extract Content from Various Completion Formats """
+    if isinstance(response, dict) and "content" in response:
+        return response["content"]
+    elif isinstance(response, list) and len(response) > 0:
+        if isinstance(response[0], dict) and "content" in response[0]:
+            return response[0]["content"]
+    return str(response)
+
+def extract_xml_answer(text: str) -> str:
+    """ Extract answer from XML-like tags """
+    if "<answer>" in text and "</answer>" in text:
+        answer = text.split("<answer>")[-1]
+        answer = answer.split("</answer>")[0]
+        return answer.strip()
+    return text.strip()
+
+def extract_hash_answer(text: str) -> str | None:
+    if "####" not in text:
+        return None
+    return text.split("####")[1].strip()
+
 def tokenize_text(text: str) -> list[str]:
     try:
         return nltk.word_tokenize(text.lower())
     except:
-        return text.split()
+        return text.lower().split()
 
 # Compute BLEU score
 def compute_bleu(reference: str, hypothesis: str, weights=(0.25, 0.25, 0.25, 0.25)) -> float:
@@ -36,9 +67,11 @@ def compute_bleu(reference: str, hypothesis: str, weights=(0.25, 0.25, 0.25, 0.2
     except:
         return 0.0
 
+
+# ======= Main Diversity Reward Functions =======
 # MUST BE IN Functions(BLEU Regarding things; negative(-) bleu, bleu in denominator, 1-BLEU, SMI, etc)
 # a) Negative BLEU Reward
-def negative_bleu_reward_func(prompts: str, completions: str, references: str=None, **kwargs) -> list[float]:
+def interactive_negative_bleu_reward_func(prompts: str, completions: str, references: str=None, **kwargs) -> list[float]:
     """ 
         Calculate negative BLEU score between completions and references.
         It means that higher BLEU score results in lower reward.
@@ -67,7 +100,7 @@ def negative_bleu_reward_func(prompts: str, completions: str, references: str=No
     return rewards
     
 # b) BLEU in Denominator Reward
-def bleu_in_denominator_reward_func(prompts: str, completions: str, references: str=None, **kwargs) -> list[float]:
+def interactive_bleu_in_denominator_reward_func(prompts: str, completions: str, references: str=None, **kwargs) -> list[float]:
     """
         Calculate reward as 1 / (1 + BLEU score between completions and references).
         It means that higher BLEU score results in lower reward.
@@ -99,7 +132,7 @@ def bleu_in_denominator_reward_func(prompts: str, completions: str, references: 
     return rewards
 
 # c) 1 - BLEU Reward    
-def one_minus_bleu_reward_func(prompts: str, completions: str, references: str=None, **kwargs) -> list[float]:
+def interactive_one_minus_bleu_reward_func(prompts: str, completions: str, references: str=None, **kwargs) -> list[float]:
     """
         Calculate reward as 1 - BLEU score between completions and references.
         It means that higher BLEU score results in lower reward.
@@ -156,7 +189,7 @@ def pre_smi_reward_func(prompts: str, completions: str, **kwargs) -> list[float]
         
         bleu_scores = []
         for other_response in other_responses:
-            bleu = calculate_bleu(other_response, target_response)
+            bleu = compute_bleu(other_response, target_response)
             bleu_scores.append(bleu)
         
         # AVG Self-BLEU
@@ -200,7 +233,7 @@ def smi_reward_func(prompts: str, completions: str, references: str=None, **kwar
     return rewards
 
 # e) BLEU Difference Reward
-def bleu_difference_reward_func(prompt: str, completions: str, reference: str=None, **kwargs) -> list[float]:
+def interactive_bleu_difference_reward_func(prompt: str, completions: str, reference: str=None, **kwargs) -> list[float]:
     """
         Calculate reward as the difference between BLEU(input, GT) and BLEU(input, pred).
         Reward = BLEU(input, GT) - BLEU(input, pred)
